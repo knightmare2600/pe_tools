@@ -3,9 +3,9 @@
  * miniterm.cpp - ConPTY WinPE Terminal (Faxe Kondi Edition)
  * =============================================================================
  *
- *  Project:     miniterm
- *  File:        miniterm.cpp
- *  Description: Minimal terminal emulator for Windows (Win32 / WinPE).
+ * Project:      miniterm
+ * File:         miniterm.cpp
+ * Description:  Minimal terminal emulator for Windows (Win32 / WinPE).
  *
  * Purpose:      Minimal terminal emulator for Windows PE using ConPTY. Provides
  *               PowerShell (pwsh.exe) interactive session with basic ANSI
@@ -210,7 +210,7 @@
  *  - Add -debug flag writes miniterm_debug.txt alongside exe. Logs: CELL_W/H,
  *    font metrics, per-glyph advance width, rightSideBearing, leftSideBearing,
  *    glyph_w used, layout actual rendered width. Enables diagnosis of wide
-*     glyph clipping without guessing.
+ *    glyph clipping without guessing.
  *  - Wide glyph render path: CreateTextLayout + NO_WRAP at glyph_w width,
  *    Transform/DrawGlyphRun removed.
  *  - Dead code removed (get_glyph_index, get_em_size no longer needed without
@@ -229,18 +229,17 @@
  *    ref_advance (same width as M) for PUA range U+E000-U+F8FF and Nerd Font
  *    ranges, in addition to existing 1.5x threshold for CJK etc. It correctly
  *    catches Nerd Font icons whose advance == CELL_W but whose ink overflows
-  *  - Debug flag logs: font file probe result, font load success/failure,
+ *  - Debug flag logs: font file probe result, font load success/failure,
  *    IDWriteFactory3 availability, fontface extraction, ref_advance, CELL_W/H,
  *    per-glyph advance/rsb/lsb/ink metrics, is_wide result, layout maxWidth
  *    used, actual DirectWrite rendered width per glyph, & frame render stats.
  *
- * ============================================================
-  *
+ * =============================================================================
+ *
  * Build:
  *
  * cl miniterm.cpp miniterm.res /EHsc /std:c++17 /MT user32.lib kernel32.lib gdi32.lib d2d1.lib dwrite.lib ole32.lib shlwapi.lib comdlg32.lib comctl32.lib /link /OUT:miniterm-%VSCMD_ARG_TGT_ARCH%.exe /MANIFEST:EMBED /MANIFESTINPUT:miniterm.exe.manifest
- *
- * ============================================================
+ * =============================================================================
  */
 
 #define WIN32_LEAN_AND_MEAN
