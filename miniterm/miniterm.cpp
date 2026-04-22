@@ -16,7 +16,6 @@
  *   + screen buffer (120x40)
  *   + minimal ANSI parser
  *   + frame-throttled renderer
-
  *
  * Copyright (C) 2026  Knightmare2600
  *
