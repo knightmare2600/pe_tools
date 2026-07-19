@@ -179,8 +179,12 @@ static void debug_open()
 #define IDC_PREF_OK              4007
 #define IDC_PREF_CANCEL          4008
 #define IDM_TAB_CLOSE            6001
+#define IDM_TAB_RENAME           6002
 #define WM_APP_SESSION_ENDED     (WM_APP + 1)
 #define IDC_TABCTRL              7001
+#define IDC_RENAME_EDIT          8001
+#define IDC_RENAME_OK            8002
+#define IDC_RENAME_CANCEL        8003
 
 // =====================================================
 // THEME + PALETTE
@@ -638,10 +642,27 @@ static void update_statusbar()
   if (!g_statusbar) return;
   const wchar_t* tn =
     (g_theme == Theme::SolarizedDark) ? L"Solarized Dark" : L"Solarized Light";
-  wchar_t buf[512];
-  wsprintfW(buf, L"  Theme: %s    Shell: %s    Ln %d  Col %d",
-    tn, g_shellname.c_str(), cy + 1, cx + 1);
-  SetWindowTextW(g_statusbar, buf);
+
+  RECT sb = {};
+  GetClientRect(g_statusbar, &sb);
+  int w = sb.right - sb.left;
+  if (w <= 0) w = 800;
+  int parts[4] = { w * 35 / 100, w * 60 / 100, w * 82 / 100, -1 };
+  SendMessageW(g_statusbar, SB_SETPARTS, 4, (LPARAM)parts);
+
+  const wchar_t* session_name =
+    (g_active_session >= 0 && g_active_session < (int)g_sessions.size())
+    ? g_sessions[g_active_session]->name.c_str() : L"";
+
+  wchar_t buf[256];
+  wsprintfW(buf, L"  %s", session_name);
+  SendMessageW(g_statusbar, SB_SETTEXTW, 0, (LPARAM)buf);
+  wsprintfW(buf, L"Shell: %s", g_shellname.c_str());
+  SendMessageW(g_statusbar, SB_SETTEXTW, 1, (LPARAM)buf);
+  wsprintfW(buf, L"Theme: %s", tn);
+  SendMessageW(g_statusbar, SB_SETTEXTW, 2, (LPARAM)buf);
+  wsprintfW(buf, L"Ln %d  Col %d", cy + 1, cx + 1);
+  SendMessageW(g_statusbar, SB_SETTEXTW, 3, (LPARAM)buf);
 }
 
 // =====================================================
@@ -1659,6 +1680,78 @@ static void do_preferences()
 }
 
 // =====================================================
+// RENAME TAB DIALOG — same in-memory DLGTEMPLATE technique as
+// Preferences, reusing its dlg_* helpers.
+// =====================================================
+static std::vector<BYTE> build_rename_template()
+{
+  std::vector<BYTE> b;
+  const WORD kItemCount = 3;
+
+  dlg_dword(b, DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME);
+  dlg_dword(b, 0);
+  dlg_word(b, kItemCount);
+  dlg_word(b, 0); dlg_word(b, 0);
+  dlg_word(b, 180); dlg_word(b, 58);
+  dlg_word(b, 0);
+  dlg_word(b, 0);
+  dlg_wstr(b, L"Rename Tab");
+  dlg_word(b, 9);
+  dlg_wstr(b, L"Segoe UI");
+
+  dlg_item(b, ES_AUTOHSCROLL|WS_TABSTOP|WS_BORDER, 6,  8, 168, 12, IDC_RENAME_EDIT,   kClsEdit,   L"");
+  dlg_item(b, BS_DEFPUSHBUTTON|WS_TABSTOP,        36, 32,  50, 14, IDC_RENAME_OK,     kClsButton, L"OK");
+  dlg_item(b, WS_TABSTOP,                         94, 32,  50, 14, IDC_RENAME_CANCEL, kClsButton, L"Cancel");
+
+  return b;
+}
+
+struct RenameResult { std::wstring name; bool ok = false; } g_rename_result;
+
+static INT_PTR CALLBACK rename_dlg_proc(HWND hDlg, UINT msg, WPARAM wp, LPARAM)
+{
+  switch (msg) {
+    case WM_INITDIALOG:
+      SetDlgItemTextW(hDlg, IDC_RENAME_EDIT, g_rename_result.name.c_str());
+      SendMessageW(GetDlgItem(hDlg, IDC_RENAME_EDIT), EM_SETSEL, 0, -1);
+      SetFocus(GetDlgItem(hDlg, IDC_RENAME_EDIT));
+      return FALSE;  // we set focus ourselves
+    case WM_COMMAND:
+      switch (LOWORD(wp)) {
+        case IDC_RENAME_OK: {
+          wchar_t buf[64] = {};
+          GetDlgItemTextW(hDlg, IDC_RENAME_EDIT, buf, 64);
+          g_rename_result.name = buf;
+          g_rename_result.ok = true;
+          EndDialog(hDlg, IDC_RENAME_OK);
+          return TRUE;
+        }
+        case IDC_RENAME_CANCEL: EndDialog(hDlg, IDC_RENAME_CANCEL); return TRUE;
+      }
+      return FALSE;
+    case WM_CLOSE:
+      EndDialog(hDlg, IDC_RENAME_CANCEL);
+      return TRUE;
+  }
+  return FALSE;
+}
+
+static void do_rename_tab(int idx)
+{
+  if (idx < 0 || idx >= (int)g_sessions.size()) return;
+  g_rename_result.name = g_sessions[idx]->name;
+  g_rename_result.ok   = false;
+
+  std::vector<BYTE> tmpl = build_rename_template();
+  DialogBoxIndirectParamW(GetModuleHandleW(NULL),
+    (LPCDLGTEMPLATEW)tmpl.data(), hwnd, rename_dlg_proc, 0);
+
+  if (!g_rename_result.ok || g_rename_result.name.empty()) return;
+  g_sessions[idx]->name = g_rename_result.name;
+  rebuild_tab_ui();
+}
+
+// =====================================================
 // RENDER — message thread only
 //
 // KEY DESIGN DECISIONS:
@@ -2087,6 +2180,10 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
           if (g_ctx_tab_idx >= 0) close_session(g_ctx_tab_idx, false);
           g_ctx_tab_idx = -1;
           return 0;
+        case IDM_TAB_RENAME:
+          if (g_ctx_tab_idx >= 0) do_rename_tab(g_ctx_tab_idx);
+          g_ctx_tab_idx = -1;
+          return 0;
         case IDM_HELP_ABOUT:
           MessageBoxW(h,
             L"miniterm v2.8\nConPTY WinPE Terminal\n\n"
@@ -2113,7 +2210,8 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
           if (idx >= 0) {
             g_ctx_tab_idx = idx;
             HMENU menu = CreatePopupMenu();
-            AppendMenuW(menu, MF_STRING, IDM_TAB_CLOSE, L"Close Tab");
+            AppendMenuW(menu, MF_STRING, IDM_TAB_RENAME, L"Rename...");
+            AppendMenuW(menu, MF_STRING, IDM_TAB_CLOSE,  L"Close Tab");
             TrackPopupMenu(menu, TPM_LEFTALIGN | TPM_RIGHTBUTTON, pt.x, pt.y, 0, h, nullptr);
             DestroyMenu(menu);
           }
