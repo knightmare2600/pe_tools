@@ -165,6 +165,8 @@ static void debug_open()
 #define IDC_PREF_FONT_SIZE       4003
 #define IDC_PREF_FONT_BROWSE     4004
 #define IDC_PREF_SCROLLBACK      4005
+#define IDM_SHELL_BASE           5000
+#define IDM_SHELL_MAX            32
 #define IDC_PREF_DEFAULT_SHELL   4006
 #define IDC_PREF_OK              4007
 #define IDC_PREF_CANCEL          4008
@@ -263,6 +265,10 @@ static HANDLE  hInR   = nullptr;
 static HANDLE  hInW   = nullptr;
 static HANDLE  hOutR  = nullptr;
 static HANDLE  hOutW  = nullptr;
+
+static PROCESS_INFORMATION g_child_pi        = {};
+static HANDLE               g_reader_thread   = nullptr;
+static volatile bool         g_shell_switching = false;
 
 // =====================================================
 // DIRECTWRITE
@@ -1864,14 +1870,22 @@ static void show_context_menu(int sx, int sy)
 // =====================================================
 // MENU BAR
 // =====================================================
+static HMENU g_shell_menu = nullptr;
+
 static HMENU create_menu()
 {
   HMENU bar = CreateMenu(), file = CreatePopupMenu(),
         theme = CreatePopupMenu(), help = CreatePopupMenu();
+  g_shell_menu = CreatePopupMenu();
+  for (size_t i = 0; i < g_config.shells.size() && i < IDM_SHELL_MAX; i++) {
+    UINT flags = MF_STRING | ((g_config.shells[i].name == g_shellname) ? MF_CHECKED : 0);
+    AppendMenuW(g_shell_menu, flags, IDM_SHELL_BASE + (UINT)i, g_config.shells[i].name.c_str());
+  }
   AppendMenuW(theme, MF_STRING, IDM_FILE_THEME_DARK,  L"Solarized Dark");
   AppendMenuW(theme, MF_STRING, IDM_FILE_THEME_LIGHT, L"Solarized Light");
   AppendMenuW(file, MF_STRING|MF_GRAYED, IDM_FILE_NEWTAB,  L"New Tab\t(coming soon)");
   AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(file, MF_POPUP, (UINT_PTR)g_shell_menu, L"Shell");
   AppendMenuW(file, MF_POPUP, (UINT_PTR)theme, L"Theme");
   AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(file, MF_STRING, IDM_FILE_FONT,    L"Font...");
@@ -1886,6 +1900,8 @@ static HMENU create_menu()
   AppendMenuW(bar, MF_POPUP, (UINT_PTR)help, L"Help");
   return bar;
 }
+
+static void switch_shell(const ShellPreset& sp);
 
 // =====================================================
 // WINDOW PROC
@@ -1976,6 +1992,11 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
       PAINTSTRUCT ps; BeginPaint(h, &ps); render(); EndPaint(h, &ps); return 0; }
 
     case WM_COMMAND:
+      if (LOWORD(w) >= IDM_SHELL_BASE && LOWORD(w) < IDM_SHELL_BASE + IDM_SHELL_MAX) {
+        size_t idx = LOWORD(w) - IDM_SHELL_BASE;
+        if (idx < g_config.shells.size()) switch_shell(g_config.shells[idx]);
+        return 0;
+      }
       switch (LOWORD(w)) {
         case IDM_CTX_COPY:
           if (g_sel_active) { copy_selection_to_clipboard(); g_sel_active=false; InvalidateRect(h,NULL,FALSE); } return 0;
@@ -2311,6 +2332,10 @@ static bool launch_shell()
   PROCESS_INFORMATION pi = {};
   BOOL ok = CreateProcessW(res.c_str(), mc.data(), NULL, NULL, FALSE,
     EXTENDED_STARTUPINFO_PRESENT, NULL, NULL, &si.StartupInfo, &pi);
+
+  DeleteProcThreadAttributeList(si.lpAttributeList);
+  HeapFree(GetProcessHeap(), 0, si.lpAttributeList);
+
   if (!ok) {
     DWORD err = GetLastError(); wchar_t buf[128];
     wsprintfW(buf, L"[miniterm] CreateProcessW: GLE=0x%08X", err);
@@ -2318,7 +2343,9 @@ static bool launch_shell()
     InvalidateRect(hwnd, NULL, FALSE); return false;
   }
   CloseHandle(hInR); CloseHandle(hOutW);
-  CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+  // Keep the process handles (g_child_pi) so switch_shell() can terminate
+  // this child cleanly when the user picks a different shell.
+  g_child_pi = pi;
   return true;
 }
 
@@ -2338,8 +2365,63 @@ DWORD WINAPI reader(LPVOID)
     LeaveCriticalSection(&g_cs);
     update_scrollbar(); update_statusbar(); InvalidateRect(hwnd, NULL, FALSE);
   }
-  PostMessageW(hwnd, WM_CLOSE, 0, 0);
+  // A deliberate shell switch tears this pipe down on purpose (see
+  // switch_shell()) -- don't close the whole app in that case.
+  if (!g_shell_switching) PostMessageW(hwnd, WM_CLOSE, 0, 0);
   return 0;
+}
+
+// =====================================================
+// SHELL SWITCH — tears down the running child and PTY, then
+// launches a different preset in the same window. Full multi-shell
+// (several shells open at once) arrives with per-tab sessions; this
+// replaces the single current session's shell.
+// =====================================================
+static void switch_shell(const ShellPreset& sp)
+{
+  if (sp.name == g_shellname) return;
+
+  g_shell_switching = true;
+
+  if (g_hpc) { ClosePseudoConsole(g_hpc); g_hpc = nullptr; }
+  if (g_child_pi.hProcess) {
+    TerminateProcess(g_child_pi.hProcess, 0);
+    WaitForSingleObject(g_child_pi.hProcess, 2000);
+    CloseHandle(g_child_pi.hProcess);
+    CloseHandle(g_child_pi.hThread);
+    g_child_pi = PROCESS_INFORMATION{};
+  }
+  if (hInW)  { CloseHandle(hInW);  hInW  = nullptr; }
+  if (hOutR) { CloseHandle(hOutR); hOutR = nullptr; }  // unblocks reader()'s ReadFile
+
+  if (g_reader_thread) {
+    WaitForSingleObject(g_reader_thread, 2000);
+    CloseHandle(g_reader_thread);
+    g_reader_thread = nullptr;
+  }
+
+  g_exe = sp.exe; g_args = sp.args; g_shellname = sp.name;
+
+  EnterCriticalSection(&g_cs);
+  screen_clear_region(0, 0, W - 1, H - 1);
+  cx = 0; cy = 0;
+  g_history.clear(); g_view_top = 0; g_at_bottom = true;
+  LeaveCriticalSection(&g_cs);
+
+  g_shell_switching = false;
+
+  if (launch_shell())
+    g_reader_thread = CreateThread(NULL, 0, reader, NULL, 0, NULL);
+
+  if (g_shell_menu) {
+    for (size_t i = 0; i < g_config.shells.size() && i < IDM_SHELL_MAX; i++)
+      CheckMenuItem(g_shell_menu, IDM_SHELL_BASE + (UINT)i, MF_BYCOMMAND |
+        ((g_config.shells[i].name == g_shellname) ? MF_CHECKED : MF_UNCHECKED));
+  }
+
+  update_statusbar();
+  InvalidateRect(hwnd, NULL, FALSE);
+  config_save_now();
 }
 
 // =====================================================
@@ -2377,7 +2459,7 @@ int wmain(int argc, wchar_t** argv)
   init_dw();
 
   if (launch_shell())
-    CreateThread(NULL, 0, reader, NULL, 0, NULL);
+    g_reader_thread = CreateThread(NULL, 0, reader, NULL, 0, NULL);
 
   MSG msg;
   while (GetMessageW(&msg, NULL, 0, 0)) {
@@ -2385,6 +2467,13 @@ int wmain(int argc, wchar_t** argv)
   }
 
   config_save_now();
+
+  if (g_child_pi.hProcess) {
+    CloseHandle(g_child_pi.hProcess);
+    CloseHandle(g_child_pi.hThread);
+    g_child_pi = PROCESS_INFORMATION{};
+  }
+  if (g_reader_thread) { CloseHandle(g_reader_thread); g_reader_thread = nullptr; }
 
   clear_layout_cache();
   if (g_fontface) { g_fontface->Release(); g_fontface = nullptr; }
