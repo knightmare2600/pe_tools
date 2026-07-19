@@ -193,6 +193,8 @@ static void debug_open()
 #define IDC_RENAME_EDIT          8001
 #define IDC_RENAME_OK            8002
 #define IDC_RENAME_CANCEL        8003
+#define IDC_ABOUT_TEXT           8101
+#define IDC_ABOUT_OK             8102
 
 // =====================================================
 // THEME + PALETTE
@@ -1772,6 +1774,89 @@ static void do_rename_tab(int idx)
 }
 
 // =====================================================
+// ABOUT DIALOG
+// The about text lives in a read-only multiline edit (rather than a
+// static) purely so it can receive WM_CHAR: typing 'ø' or 'Ø' closes
+// the box and shows a small Danish aside. Uses \u escapes for the
+// Danish characters rather than literal bytes, since the build never
+// pins a source charset (no /utf-8 or /source-charset flag) -- literal
+// non-ASCII bytes here would be at the mercy of whatever codepage MSVC
+// assumes for this file.
+// =====================================================
+static const wchar_t* k_about_text =
+  L"miniterm v2.8\r\nConPTY WinPE Terminal\r\n\r\n"
+  L"Glyph rendering fix: layout maxWidth=CELL_W*3,\r\n"
+  L"no clip on narrow glyphs, fat -debug mode.";
+
+static std::vector<BYTE> build_about_template()
+{
+  std::vector<BYTE> b;
+  const WORD kItemCount = 2;
+
+  dlg_dword(b, DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME);
+  dlg_dword(b, 0);
+  dlg_word(b, kItemCount);
+  dlg_word(b, 0); dlg_word(b, 0);
+  dlg_word(b, 220); dlg_word(b, 92);
+  dlg_word(b, 0);
+  dlg_word(b, 0);
+  dlg_wstr(b, L"About miniterm");
+  dlg_word(b, 9);
+  dlg_wstr(b, L"Segoe UI");
+
+  dlg_item(b, ES_MULTILINE|ES_READONLY|WS_TABSTOP,
+           6,  8, 208, 56, IDC_ABOUT_TEXT, kClsEdit,   L"");
+  dlg_item(b, BS_DEFPUSHBUTTON|WS_TABSTOP,
+           82, 70,  56, 14, IDC_ABOUT_OK,  kClsButton, L"OK");
+
+  return b;
+}
+
+static LRESULT CALLBACK about_edit_subclass(HWND hEdit, UINT msg, WPARAM wp, LPARAM lp,
+                                             UINT_PTR, DWORD_PTR)
+{
+  if (msg == WM_CHAR && (wp == 0x00F8 || wp == 0x00D8)) {  // ø = o slash, Ø = O slash
+    SYSTEMTIME st = {};
+    GetLocalTime(&st);
+    bool christmas_eve = (st.wMonth == 12 && st.wDay == 24);
+    const wchar_t* egg = christmas_eve
+      ? L"R\u00F8dgr\u00F8d med fl\u00F8de"
+      : L"Der er ingen ko p\u00E5 isen!";
+    EndDialog(GetParent(hEdit), IDOK);
+    MessageBoxW(hwnd, egg, L"miniterm", MB_OK | MB_ICONINFORMATION);
+    return 0;
+  }
+  return DefSubclassProc(hEdit, msg, wp, lp);
+}
+
+static INT_PTR CALLBACK about_dlg_proc(HWND hDlg, UINT msg, WPARAM wp, LPARAM)
+{
+  switch (msg) {
+    case WM_INITDIALOG: {
+      HWND edit = GetDlgItem(hDlg, IDC_ABOUT_TEXT);
+      SetWindowTextW(edit, k_about_text);
+      SetWindowSubclass(edit, about_edit_subclass, 1, 0);
+      SetFocus(edit);
+      return FALSE;  // we set focus ourselves
+    }
+    case WM_COMMAND:
+      if (LOWORD(wp) == IDC_ABOUT_OK) { EndDialog(hDlg, IDOK); return TRUE; }
+      return FALSE;
+    case WM_CLOSE:
+      EndDialog(hDlg, IDCANCEL);
+      return TRUE;
+  }
+  return FALSE;
+}
+
+static void do_about()
+{
+  std::vector<BYTE> tmpl = build_about_template();
+  DialogBoxIndirectParamW(GetModuleHandleW(NULL),
+    (LPCDLGTEMPLATEW)tmpl.data(), hwnd, about_dlg_proc, 0);
+}
+
+// =====================================================
 // RENDER — message thread only
 //
 // KEY DESIGN DECISIONS:
@@ -2204,13 +2289,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
           if (g_ctx_tab_idx >= 0) do_rename_tab(g_ctx_tab_idx);
           g_ctx_tab_idx = -1;
           return 0;
-        case IDM_HELP_ABOUT:
-          MessageBoxW(h,
-            L"miniterm v2.8\nConPTY WinPE Terminal\n\n"
-            L"Glyph rendering fix: layout maxWidth=CELL_W*3,\n"
-            L"no clip on narrow glyphs, fat -debug mode.",
-            L"About miniterm", MB_OK|MB_ICONINFORMATION);
-          return 0;
+        case IDM_HELP_ABOUT: do_about(); return 0;
       }
       return 0;
 
