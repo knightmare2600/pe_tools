@@ -2251,8 +2251,13 @@ static void init_window()
   wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
   RegisterClassW(&wc);
 
+  // WS_CLIPCHILDREN is required here: without it, Direct2D's full-client
+  // Clear()/Present() each frame paints straight over the tab control
+  // (and statusbar/scrollbar), which then has to repaint itself on top --
+  // a visible flicker cycle, worst at the tab strip since that's right
+  // where the terminal's actively-redrawn content now renders.
   hwnd = CreateWindowW(L"MINITERM", L"miniterm",
-    WS_OVERLAPPEDWINDOW, 100, 100, 1000, 700,
+    WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, 100, 100, 1000, 700,
     NULL, create_menu(), wc.hInstance, NULL);
 
   g_tabctrl = CreateWindowW(WC_TABCONTROLW, nullptr,
@@ -2536,7 +2541,10 @@ static bool launch_shell()
   UpdateProcThreadAttribute(si.lpAttributeList, 0,
     PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, g_hpc, sizeof(g_hpc), NULL, NULL);
 
-  std::wstring cmd = res + L" " + g_args;
+  // res must be quoted: an unquoted path containing spaces (e.g. under
+  // "C:\Program Files\...") gets split by the child's own argv parser,
+  // which then misreads the tail of its own exe path as a stray argument.
+  std::wstring cmd = L"\"" + res + L"\" " + g_args;
   std::vector<wchar_t> mc(cmd.begin(), cmd.end()); mc.push_back(0);
   PROCESS_INFORMATION pi = {};
   BOOL ok = CreateProcessW(res.c_str(), mc.data(), NULL, NULL, FALSE,
