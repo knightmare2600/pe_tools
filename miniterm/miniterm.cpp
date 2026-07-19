@@ -2025,7 +2025,7 @@ static int   g_ctx_tab_idx = -1;
 
 static HMENU create_menu()
 {
-  HMENU bar = CreateMenu(), file = CreatePopupMenu(),
+  HMENU bar = CreateMenu(), file = CreatePopupMenu(), term = CreatePopupMenu(),
         theme = CreatePopupMenu(), help = CreatePopupMenu();
   g_shell_menu = CreatePopupMenu();
   for (size_t i = 0; i < g_config.shells.size() && i < IDM_SHELL_MAX; i++) {
@@ -2034,20 +2034,24 @@ static HMENU create_menu()
   }
   AppendMenuW(theme, MF_STRING, IDM_FILE_THEME_DARK,  L"Solarized Dark");
   AppendMenuW(theme, MF_STRING, IDM_FILE_THEME_LIGHT, L"Solarized Light");
+
   AppendMenuW(file, MF_STRING, IDM_FILE_NEWTAB,  L"New Tab");
-  AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
-  AppendMenuW(file, MF_POPUP, (UINT_PTR)g_shell_menu, L"Shell");
-  AppendMenuW(file, MF_POPUP, (UINT_PTR)theme, L"Theme");
-  AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
-  AppendMenuW(file, MF_STRING, IDM_FILE_FONT,    L"Font...");
   AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(file, MF_STRING, IDM_FILE_SAVELOG, L"Save Scrollback to Log...");
   AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(file, MF_STRING, IDM_FILE_PREFS,   L"Preferences...");
   AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(file, MF_STRING, IDM_FILE_EXIT,    L"Exit");
-  AppendMenuW(help, MF_STRING, IDM_HELP_ABOUT,   L"About");
+
+  AppendMenuW(term, MF_POPUP, (UINT_PTR)g_shell_menu, L"Shell");
+  AppendMenuW(term, MF_POPUP, (UINT_PTR)theme, L"Theme");
+  AppendMenuW(term, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(term, MF_STRING, IDM_FILE_FONT, L"Font...");
+
+  AppendMenuW(help, MF_STRING, IDM_HELP_ABOUT, L"About");
+
   AppendMenuW(bar, MF_POPUP, (UINT_PTR)file, L"File");
+  AppendMenuW(bar, MF_POPUP, (UINT_PTR)term, L"Terminal");
   AppendMenuW(bar, MF_POPUP, (UINT_PTR)help, L"Help");
   return bar;
 }
