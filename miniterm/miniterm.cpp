@@ -30,7 +30,15 @@
  * ============================================================
  *
  * BUILD:
- * cl miniterm.cpp miniterm.res /EHsc /std:c++17 /MT user32.lib kernel32.lib gdi32.lib d2d1.lib dwrite.lib ole32.lib shlwapi.lib comdlg32.lib comctl32.lib /link /MANIFEST:EMBED /MANIFESTINPUT:miniterm.exe.manifest
+ * cl miniterm.cpp miniterm.res /EHsc /std:c++17 /MT user32.lib kernel32.lib gdi32.lib d2d1.lib dwrite.lib ole32.lib shlwapi.lib comdlg32.lib comctl32.lib /link /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup /MANIFEST:EMBED /MANIFESTINPUT:miniterm.exe.manifest
+ *
+ * NOTE: /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup is required. Without it
+ * the linker auto-detects CONSOLE subsystem (it sees wmain, not WinMain),
+ * which allocates a console for the process -- on Windows 11 with Windows
+ * Terminal set as the default terminal host, that console opens inside a
+ * Windows Terminal window alongside miniterm's own window. wmainCRTStartup
+ * keeps the wide-char wmain(argc, argv) entry point while /SUBSYSTEM:WINDOWS
+ * suppresses the console allocation.
  *
  * VERSION HISTORY:
  * v1.4   - Stable Launch Fix

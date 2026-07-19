@@ -44,7 +44,8 @@ jobs:
         run: >
           cl miniterm.cpp miniterm.res /EHsc /std:c++17 /MT
           user32.lib kernel32.lib gdi32.lib d2d1.lib dwrite.lib ole32.lib shlwapi.lib comdlg32.lib comctl32.lib
-          /link /MANIFEST:EMBED /MANIFESTINPUT:miniterm.exe.manifest /OUT:miniterm-${{ matrix.out_arch }}.exe
+          /link /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup
+          /MANIFEST:EMBED /MANIFESTINPUT:miniterm.exe.manifest /OUT:miniterm-${{ matrix.out_arch }}.exe
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
