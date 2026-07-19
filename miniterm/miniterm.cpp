@@ -295,6 +295,17 @@ static PROCESS_INFORMATION g_child_pi        = {};
 static HANDLE               g_reader_thread   = nullptr;
 static volatile bool         g_shell_switching = false;
 
+// Set (from the main thread's 500ms poll timer) when the active
+// session's child process is found to have exited but reader()'s
+// ReadFile hadn't noticed on its own -- ConPTY doesn't reliably signal
+// EOF on the output pipe just because the hosted process exited; the
+// client is expected to notice via the process handle and act.
+// CancelIoEx unblocks the pending ReadFile so reader() can act on it;
+// this flag lets reader() tell that apart from an ordinary pause/switch
+// cancellation, which also uses CancelIoEx but must NOT be reported as
+// a session ending.
+static volatile bool g_watcher_signals_exit = false;
+
 // =====================================================
 // SESSIONS (tabs)
 //
@@ -2244,8 +2255,19 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
       pty_resize(); InvalidateRect(h, NULL, FALSE); return 0;
 
     case WM_TIMER:
-      if (w == IDT_SIZE_POLL) pty_resize();
-      else if (w == IDT_CURSOR_BLINK) {
+      if (w == IDT_SIZE_POLL) {
+        pty_resize();
+        // ConPTY doesn't reliably close the output pipe just because the
+        // hosted shell exited (e.g. typing "exit") -- reader() can stay
+        // blocked in ReadFile indefinitely otherwise. Piggyback on this
+        // existing poll to notice and unblock it. Non-blocking check
+        // (timeout 0), main thread only, so no new synchronisation needed.
+        if (g_reader_thread && g_child_pi.hProcess &&
+            WaitForSingleObject(g_child_pi.hProcess, 0) == WAIT_OBJECT_0) {
+          g_watcher_signals_exit = true;
+          if (hOutR) CancelIoEx(hOutR, NULL);
+        }
+      } else if (w == IDT_CURSOR_BLINK) {
         g_cursor_visible = !g_cursor_visible;
         if (g_at_bottom) InvalidateRect(h, NULL, FALSE); }
       return 0;
@@ -2677,14 +2699,24 @@ DWORD WINAPI reader(LPVOID)
     LeaveCriticalSection(&g_cs);
     update_scrollbar(); update_statusbar(); InvalidateRect(hwnd, NULL, FALSE);
   }
-  // Three ways this loop can end:
+  // Four ways this loop can end:
   //  1. Deliberate shell switch (switch_shell) closed the pipe on purpose.
   //  2. Deliberate tab backgrounding (session_pause_reader) cancelled the
   //     pending ReadFile via CancelIoEx without closing anything -- the
   //     handle stays valid so a later reader thread can resume from it.
-  //  3. The child process actually exited -- a genuine session end.
-  // Only case 3 should tell the UI thread a session died.
-  if (g_shell_switching || GetLastError() == ERROR_OPERATION_ABORTED) return 0;
+  //  3. The child process exited and ConPTY promptly signalled EOF on
+  //     its own (ReadFile fails with something other than the operator-
+  //     cancelled error below).
+  //  4. The child process exited but ConPTY did NOT close the pipe on
+  //     its own -- the WM_TIMER poll noticed via the process handle and
+  //     used the same CancelIoEx mechanism as case 2 to unblock us, but
+  //     set g_watcher_signals_exit first so we can tell it apart from a
+  //     genuine pause/switch.
+  // Cases 3 and 4 should tell the UI thread a session died; 1 and 2 must not.
+  bool watcher_exit = g_watcher_signals_exit;
+  g_watcher_signals_exit = false;
+  if (g_shell_switching) return 0;
+  if (GetLastError() == ERROR_OPERATION_ABORTED && !watcher_exit) return 0;
   PostMessageW(hwnd, WM_APP_SESSION_ENDED, (WPARAM)g_active_session, 0);
   return 0;
 }
