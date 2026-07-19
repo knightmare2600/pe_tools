@@ -7,6 +7,8 @@
 #include <dwrite_3.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <string>
 #include <vector>
 #include <deque>
@@ -152,11 +154,20 @@ static void debug_open()
 #define IDM_FILE_EXIT            1005
 #define IDM_FILE_FONT            1006
 #define IDM_HELP_ABOUT           1007
+#define IDM_FILE_PREFS           1008
 #define IDM_CTX_COPY             2001
 #define IDM_CTX_PASTE            2002
 #define IDM_CTX_CLEAR_SCROLLBACK 2003
 #define IDT_SIZE_POLL            3001
 #define IDT_CURSOR_BLINK         3002
+#define IDC_PREF_THEME           4001
+#define IDC_PREF_FONT_NAME       4002
+#define IDC_PREF_FONT_SIZE       4003
+#define IDC_PREF_FONT_BROWSE     4004
+#define IDC_PREF_SCROLLBACK      4005
+#define IDC_PREF_DEFAULT_SHELL   4006
+#define IDC_PREF_OK              4007
+#define IDC_PREF_CANCEL          4008
 
 // =====================================================
 // THEME + PALETTE
@@ -901,6 +912,328 @@ static void parse_args(int argc, wchar_t** argv)
 }
 
 // =====================================================
+// MINIMAL JSON — scoped exactly to miniterm.json's needs.
+// Read side is a generic value tree (robust to hand-edits and
+// whitespace/ordering differences); write side is schema-specific
+// (we always control the shape we emit, so no generic serializer
+// is needed). No external dependency — single translation unit.
+// =====================================================
+struct JsonValue {
+  enum class Type { Null, Bool, Number, String, Array, Object } type = Type::Null;
+  bool                                             b   = false;
+  double                                           num = 0.0;
+  std::wstring                                     str;
+  std::vector<JsonValue>                           arr;
+  std::vector<std::pair<std::wstring, JsonValue>>  obj;
+
+  const JsonValue* find(const wchar_t* key) const {
+    if (type != Type::Object) return nullptr;
+    for (auto& kv : obj) if (kv.first == key) return &kv.second;
+    return nullptr;
+  }
+  std::wstring get_str(const wchar_t* key, const std::wstring& def) const {
+    const JsonValue* v = find(key);
+    return (v && v->type == Type::String) ? v->str : def;
+  }
+  double get_num(const wchar_t* key, double def) const {
+    const JsonValue* v = find(key);
+    return (v && v->type == Type::Number) ? v->num : def;
+  }
+  int get_int(const wchar_t* key, int def) const {
+    return (int)get_num(key, (double)def);
+  }
+};
+
+struct JsonParser {
+  const char* p;
+  const char* end;
+  bool        ok = true;
+
+  explicit JsonParser(const std::string& text)
+    : p(text.data()), end(text.data() + text.size()) {}
+
+  void skip_ws() { while (p < end && (unsigned char)*p <= ' ') p++; }
+
+  static void append_cp(std::wstring& s, uint32_t cp) {
+    if (cp <= 0xFFFF) { s += (wchar_t)cp; }
+    else {
+      uint32_t sv = cp - 0x10000;
+      s += (wchar_t)(0xD800 | (sv >> 10));
+      s += (wchar_t)(0xDC00 | (sv & 0x3FF));
+    }
+  }
+
+  std::wstring parse_string_raw() {
+    std::wstring out;
+    skip_ws();
+    if (p >= end || *p != '"') { ok = false; return out; }
+    p++;
+    Utf8Decoder dec;
+    while (p < end && *p != '"') {
+      if (*p == '\\') {
+        p++;
+        if (p >= end) { ok = false; break; }
+        char e = *p++;
+        if (e == '"')       out += L'"';
+        else if (e == '\\') out += L'\\';
+        else if (e == '/')  out += L'/';
+        else if (e == 'n')  out += L'\n';
+        else if (e == 't')  out += L'\t';
+        else if (e == 'r')  out += L'\r';
+        else if (e == 'b')  out += L'\b';
+        else if (e == 'f')  out += L'\f';
+        else if (e == 'u') {
+          if (end - p < 4) { ok = false; break; }
+          uint32_t cp = 0;
+          for (int i = 0; i < 4; i++) {
+            char c = p[i]; cp <<= 4;
+            if      (c >= '0' && c <= '9') cp |= (uint32_t)(c - '0');
+            else if (c >= 'a' && c <= 'f') cp |= (uint32_t)(c - 'a' + 10);
+            else if (c >= 'A' && c <= 'F') cp |= (uint32_t)(c - 'A' + 10);
+            else ok = false;
+          }
+          p += 4;
+          append_cp(out, cp);
+        } else ok = false;
+      } else {
+        uint32_t cp = 0;
+        if (dec.feed((uint8_t)*p, cp)) append_cp(out, cp);
+        p++;
+      }
+    }
+    if (p < end && *p == '"') p++; else ok = false;
+    return out;
+  }
+
+  JsonValue parse_number() {
+    const char* start = p;
+    if (p < end && (*p == '-' || *p == '+')) p++;
+    while (p < end && ((*p >= '0' && *p <= '9') || *p=='.' || *p=='e' || *p=='E' || *p=='-' || *p=='+')) p++;
+    JsonValue v; v.type = JsonValue::Type::Number;
+    if (p == start) { ok = false; return v; }
+    v.num = atof(std::string(start, p).c_str());
+    return v;
+  }
+
+  JsonValue parse_object() {
+    JsonValue v; v.type = JsonValue::Type::Object;
+    p++; skip_ws();
+    if (p < end && *p == '}') { p++; return v; }
+    while (p < end) {
+      std::wstring key = parse_string_raw();
+      skip_ws();
+      if (p >= end || *p != ':') { ok = false; break; }
+      p++;
+      v.obj.emplace_back(key, parse_value());
+      skip_ws();
+      if (p < end && *p == ',') { p++; continue; }
+      if (p < end && *p == '}') { p++; break; }
+      ok = false; break;
+    }
+    return v;
+  }
+
+  JsonValue parse_array() {
+    JsonValue v; v.type = JsonValue::Type::Array;
+    p++; skip_ws();
+    if (p < end && *p == ']') { p++; return v; }
+    while (p < end) {
+      v.arr.push_back(parse_value());
+      skip_ws();
+      if (p < end && *p == ',') { p++; continue; }
+      if (p < end && *p == ']') { p++; break; }
+      ok = false; break;
+    }
+    return v;
+  }
+
+  JsonValue parse_value() {
+    skip_ws();
+    if (p >= end) { ok = false; return JsonValue{}; }
+    if (*p == '{') return parse_object();
+    if (*p == '[') return parse_array();
+    if (*p == '"') { JsonValue v; v.type = JsonValue::Type::String; v.str = parse_string_raw(); return v; }
+    if (*p == 't') {
+      if (end - p >= 4 && strncmp(p, "true", 4) == 0) { p += 4; JsonValue v; v.type = JsonValue::Type::Bool; v.b = true; return v; }
+      ok = false; return JsonValue{};
+    }
+    if (*p == 'f') {
+      if (end - p >= 5 && strncmp(p, "false", 5) == 0) { p += 5; JsonValue v; v.type = JsonValue::Type::Bool; v.b = false; return v; }
+      ok = false; return JsonValue{};
+    }
+    if (*p == 'n') {
+      if (end - p >= 4 && strncmp(p, "null", 4) == 0) { p += 4; return JsonValue{}; }
+      ok = false; return JsonValue{};
+    }
+    return parse_number();
+  }
+};
+
+static bool json_parse_file(const std::wstring& path, JsonValue& out)
+{
+  FILE* f = nullptr;
+  _wfopen_s(&f, path.c_str(), L"rb");
+  if (!f) return false;
+  fseek(f, 0, SEEK_END);
+  long sz = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  if (sz <= 0) { fclose(f); return false; }
+  std::string buf((size_t)sz, '\0');
+  size_t rd = fread(&buf[0], 1, (size_t)sz, f);
+  fclose(f);
+  buf.resize(rd);
+
+  size_t start = (buf.size() >= 3 &&
+    (uint8_t)buf[0] == 0xEF && (uint8_t)buf[1] == 0xBB && (uint8_t)buf[2] == 0xBF) ? 3 : 0;
+  JsonParser jp(buf.substr(start));
+  out = jp.parse_value();
+  return jp.ok && out.type == JsonValue::Type::Object;
+}
+
+static std::string wstr_to_utf8(const std::wstring& s)
+{
+  if (s.empty()) return std::string();
+  int len = WideCharToMultiByte(CP_UTF8, 0, s.c_str(), -1, nullptr, 0, nullptr, nullptr);
+  if (len <= 0) return std::string();
+  std::string out((size_t)len - 1, '\0');
+  WideCharToMultiByte(CP_UTF8, 0, s.c_str(), -1, &out[0], len, nullptr, nullptr);
+  return out;
+}
+
+static std::string json_escape(const std::wstring& s)
+{
+  std::string u8 = wstr_to_utf8(s), out;
+  out.reserve(u8.size() + 8);
+  for (char c : u8) {
+    if      (c == '"')  out += "\\\"";
+    else if (c == '\\') out += "\\\\";
+    else if (c == '\n') out += "\\n";
+    else if (c == '\r') out += "\\r";
+    else if (c == '\t') out += "\\t";
+    else                out += c;
+  }
+  return out;
+}
+
+// =====================================================
+// CONFIG (miniterm.json — lives next to the binary)
+// =====================================================
+struct ShellPreset {
+  std::wstring name, exe, args;
+};
+
+struct MiniConfig {
+  std::wstring             theme            = L"dark";
+  std::wstring             font_name;
+  float                    font_size        = 16.0f;
+  int                      scrollback_lines = 1000;
+  std::wstring             default_shell    = L"pwsh";
+  std::vector<ShellPreset> shells;
+};
+
+static MiniConfig g_config;
+
+static std::wstring theme_to_str(Theme t) { return (t == Theme::SolarizedDark) ? L"dark" : L"light"; }
+static Theme        str_to_theme(const std::wstring& s) { return (s == L"light") ? Theme::SolarizedLight : Theme::SolarizedDark; }
+
+static std::wstring config_path()
+{
+  wchar_t buf[MAX_PATH] = {};
+  GetModuleFileNameW(nullptr, buf, MAX_PATH);
+  std::wstring p = buf;
+  size_t sl = p.rfind(L'\\');
+  if (sl != std::wstring::npos) p = p.substr(0, sl + 1);
+  return p + L"miniterm.json";
+}
+
+static void config_set_defaults(MiniConfig& c)
+{
+  c.shells.clear();
+  c.shells.push_back({ L"cmd", L"cmd.exe", L"" });
+  // Best-guess WinPE defaults for the PowerShell family: ExecutionPolicy
+  // Bypass so profile-based module loading (nerd font glyph modules,
+  // prompt themes) isn't blocked by WinPE's default policy, and profile
+  // loading left ON (no -NoProfile) since that's what pulls those modules
+  // in. Unverified against a live WinPE rig — revisit once testable.
+  c.shells.push_back({ L"powershell", L"powershell.exe", L"-NoLogo -ExecutionPolicy Bypass" });
+  c.shells.push_back({ L"pwsh",       L"pwsh.exe",       L"-NoLogo -ExecutionPolicy Bypass" });
+}
+
+static bool config_load(MiniConfig& c)
+{
+  config_set_defaults(c);
+  JsonValue root;
+  if (!json_parse_file(config_path(), root)) return false;
+
+  c.theme            = root.get_str(L"theme", c.theme);
+  c.scrollback_lines = root.get_int(L"scrollback_lines", c.scrollback_lines);
+  c.default_shell    = root.get_str(L"default_shell", c.default_shell);
+
+  if (const JsonValue* fontv = root.find(L"font")) {
+    c.font_name = fontv->get_str(L"name", c.font_name);
+    c.font_size = (float)fontv->get_num(L"size", c.font_size);
+  }
+
+  if (const JsonValue* shellsv = root.find(L"shells")) {
+    if (shellsv->type == JsonValue::Type::Array && !shellsv->arr.empty()) {
+      std::vector<ShellPreset> loaded;
+      for (const auto& sv : shellsv->arr) {
+        if (sv.type != JsonValue::Type::Object) continue;
+        ShellPreset sp;
+        sp.name = sv.get_str(L"name", L"");
+        sp.exe  = sv.get_str(L"exe",  L"");
+        sp.args = sv.get_str(L"args", L"");
+        if (!sp.name.empty() && !sp.exe.empty()) loaded.push_back(sp);
+      }
+      if (!loaded.empty()) c.shells = loaded;
+    }
+  }
+  return true;
+}
+
+static bool config_save(const MiniConfig& c)
+{
+  FILE* f = nullptr;
+  _wfopen_s(&f, config_path().c_str(), L"wb");
+  if (!f) return false;
+
+  std::string out;
+  out += "{\n";
+  out += "  \"theme\": \""            + json_escape(c.theme)         + "\",\n";
+  out += "  \"font\": { \"name\": \"" + json_escape(c.font_name)     + "\", \"size\": "
+       + std::to_string((int)c.font_size) + " },\n";
+  out += "  \"scrollback_lines\": "    + std::to_string(c.scrollback_lines) + ",\n";
+  out += "  \"default_shell\": \""     + json_escape(c.default_shell) + "\",\n";
+  out += "  \"shells\": [\n";
+  for (size_t i = 0; i < c.shells.size(); i++) {
+    const auto& s = c.shells[i];
+    out += "    { \"name\": \"" + json_escape(s.name) + "\", \"exe\": \"" + json_escape(s.exe)
+         + "\", \"args\": \"" + json_escape(s.args) + "\" }";
+    out += (i + 1 < c.shells.size()) ? ",\n" : "\n";
+  }
+  out += "  ]\n}\n";
+
+  fwrite(out.data(), 1, out.size(), f);
+  fclose(f);
+  return true;
+}
+
+static void config_sync_from_globals()
+{
+  g_config.theme            = theme_to_str(g_theme);
+  g_config.font_name        = g_font_name;
+  g_config.font_size        = g_font_size;
+  g_config.scrollback_lines = SCROLLBACK_LINES;
+  g_config.default_shell    = g_shellname;
+}
+
+static void config_save_now()
+{
+  config_sync_from_globals();
+  config_save(g_config);
+}
+
+// =====================================================
 // GRID HELPERS
 // =====================================================
 static void grid_put_string(const wchar_t* msg)
@@ -1064,6 +1397,208 @@ static void do_font_picker()
   rebuild_fmt(nf, ns); if (!fmt) rebuild_fmt(of, os);
   g_last_client_w = 0; g_last_client_h = 0;
   pty_resize(); InvalidateRect(hwnd, NULL, FALSE);
+  config_save_now();
+}
+
+// =====================================================
+// PREFERENCES DIALOG
+// Built as an in-memory DLGTEMPLATE so no .rc dialog resource is
+// required — keeps this a single self-contained translation unit.
+// =====================================================
+static void dlg_align(std::vector<BYTE>& b) { while (b.size() % 4) b.push_back(0); }
+static void dlg_word(std::vector<BYTE>& b, WORD w) { b.push_back((BYTE)(w & 0xFF)); b.push_back((BYTE)(w >> 8)); }
+static void dlg_dword(std::vector<BYTE>& b, DWORD d) {
+  for (int i = 0; i < 4; i++) b.push_back((BYTE)((d >> (i * 8)) & 0xFF));
+}
+static void dlg_wstr(std::vector<BYTE>& b, const wchar_t* s) {
+  for (const wchar_t* p = s; ; p++) { dlg_word(b, (WORD)*p); if (!*p) break; }
+}
+
+static void dlg_item(std::vector<BYTE>& b, DWORD style, short x, short y, short cx, short cy,
+                      WORD id, WORD cls_atom, const wchar_t* text)
+{
+  dlg_align(b);
+  dlg_dword(b, style | WS_CHILD | WS_VISIBLE);
+  dlg_dword(b, 0);                     // dwExtendedStyle
+  dlg_word(b, x); dlg_word(b, y); dlg_word(b, cx); dlg_word(b, cy);
+  dlg_word(b, id);
+  dlg_word(b, 0xFFFF); dlg_word(b, cls_atom);
+  dlg_wstr(b, text);
+  dlg_word(b, 0);                      // no creation data
+}
+
+static const WORD kClsButton = 0x0080, kClsEdit = 0x0081,
+                  kClsStatic = 0x0082, kClsCombo = 0x0085;
+
+static std::vector<BYTE> build_prefs_template()
+{
+  std::vector<BYTE> b;
+  const WORD kItemCount = 13;
+
+  dlg_dword(b, DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME);
+  dlg_dword(b, 0);
+  dlg_word(b, kItemCount);
+  dlg_word(b, 0); dlg_word(b, 0);
+  dlg_word(b, 240); dlg_word(b, 150);
+  dlg_word(b, 0);                      // no menu
+  dlg_word(b, 0);                      // default dialog class
+  dlg_wstr(b, L"miniterm Preferences");
+  dlg_word(b, 9);                      // point size
+  dlg_wstr(b, L"Segoe UI");
+
+  dlg_item(b, SS_LEFT,                       6,   8, 60, 10, (WORD)-1,              kClsStatic, L"Theme:");
+  dlg_item(b, CBS_DROPDOWNLIST|WS_TABSTOP,  70,   6,100, 60, IDC_PREF_THEME,        kClsCombo,  L"");
+
+  dlg_item(b, SS_LEFT,                       6,  24, 60, 10, (WORD)-1,              kClsStatic, L"Font name:");
+  dlg_item(b, ES_AUTOHSCROLL|WS_TABSTOP|
+              WS_BORDER,                    70,  22,100, 12, IDC_PREF_FONT_NAME,    kClsEdit,   L"");
+  dlg_item(b, WS_TABSTOP,                  174,  22, 60, 13, IDC_PREF_FONT_BROWSE,  kClsButton, L"Browse...");
+
+  dlg_item(b, SS_LEFT,                       6,  40, 60, 10, (WORD)-1,              kClsStatic, L"Font size:");
+  dlg_item(b, ES_AUTOHSCROLL|ES_NUMBER|
+              WS_TABSTOP|WS_BORDER,         70,  38, 40, 12, IDC_PREF_FONT_SIZE,    kClsEdit,   L"");
+
+  dlg_item(b, SS_LEFT,                       6,  56, 60, 10, (WORD)-1,              kClsStatic, L"Scrollback lines:");
+  dlg_item(b, ES_AUTOHSCROLL|ES_NUMBER|
+              WS_TABSTOP|WS_BORDER,         70,  54, 60, 12, IDC_PREF_SCROLLBACK,   kClsEdit,   L"");
+
+  dlg_item(b, SS_LEFT,                       6,  72, 60, 10, (WORD)-1,              kClsStatic, L"Default shell:");
+  dlg_item(b, CBS_DROPDOWNLIST|WS_TABSTOP,  70,  70,100, 60, IDC_PREF_DEFAULT_SHELL,kClsCombo,  L"");
+
+  dlg_item(b, BS_DEFPUSHBUTTON|WS_TABSTOP,  96, 128, 60, 14, IDC_PREF_OK,           kClsButton, L"OK");
+  dlg_item(b, WS_TABSTOP,                  162, 128, 60, 14, IDC_PREF_CANCEL,       kClsButton, L"Cancel");
+
+  return b;
+}
+
+struct PrefsResult {
+  Theme        theme         = Theme::SolarizedDark;
+  std::wstring font_name;
+  float        font_size     = 16.0f;
+  int          scrollback    = 1000;
+  std::wstring default_shell;
+} g_prefs_result;
+
+static INT_PTR CALLBACK prefs_dlg_proc(HWND hDlg, UINT msg, WPARAM wp, LPARAM)
+{
+  switch (msg) {
+    case WM_INITDIALOG: {
+      HWND cbTheme = GetDlgItem(hDlg, IDC_PREF_THEME);
+      SendMessageW(cbTheme, CB_ADDSTRING, 0, (LPARAM)L"Solarized Dark");
+      SendMessageW(cbTheme, CB_ADDSTRING, 0, (LPARAM)L"Solarized Light");
+      SendMessageW(cbTheme, CB_SETCURSEL, (g_theme == Theme::SolarizedDark) ? 0 : 1, 0);
+
+      SetDlgItemTextW(hDlg, IDC_PREF_FONT_NAME, g_font_name.c_str());
+      wchar_t buf[32];
+      wsprintfW(buf, L"%d", (int)g_font_size);
+      SetDlgItemTextW(hDlg, IDC_PREF_FONT_SIZE, buf);
+      wsprintfW(buf, L"%d", SCROLLBACK_LINES);
+      SetDlgItemTextW(hDlg, IDC_PREF_SCROLLBACK, buf);
+
+      HWND cbShell = GetDlgItem(hDlg, IDC_PREF_DEFAULT_SHELL);
+      int sel = 0;
+      for (size_t i = 0; i < g_config.shells.size(); i++) {
+        SendMessageW(cbShell, CB_ADDSTRING, 0, (LPARAM)g_config.shells[i].name.c_str());
+        if (g_config.shells[i].name == g_shellname) sel = (int)i;
+      }
+      SendMessageW(cbShell, CB_SETCURSEL, sel, 0);
+      return TRUE;
+    }
+
+    case WM_COMMAND:
+      switch (LOWORD(wp)) {
+        case IDC_PREF_FONT_BROWSE: {
+          LOGFONTW lf = {};
+          lf.lfCharSet = DEFAULT_CHARSET;
+          lf.lfPitchAndFamily = FIXED_PITCH | FF_MODERN;
+          wchar_t cur[256] = {};
+          GetDlgItemTextW(hDlg, IDC_PREF_FONT_NAME, cur, 256);
+          if (cur[0]) wcsncpy_s(lf.lfFaceName, cur, LF_FACESIZE - 1);
+          wchar_t szbuf[32] = {};
+          GetDlgItemTextW(hDlg, IDC_PREF_FONT_SIZE, szbuf, 32);
+          int pts = szbuf[0] ? _wtoi(szbuf) : 16;
+          lf.lfHeight = -(int)(pts * GetDeviceCaps(GetDC(hDlg), LOGPIXELSY) / 72.0f);
+          CHOOSEFONTW cf = {}; cf.lStructSize = sizeof(cf); cf.hwndOwner = hDlg; cf.lpLogFont = &lf;
+          cf.Flags = CF_INITTOLOGFONTSTRUCT | CF_FIXEDPITCHONLY | CF_FORCEFONTEXIST | CF_SCREENFONTS;
+          if (ChooseFontW(&cf)) {
+            SetDlgItemTextW(hDlg, IDC_PREF_FONT_NAME, lf.lfFaceName);
+            wchar_t nb[32]; wsprintfW(nb, L"%d", cf.iPointSize / 10);
+            SetDlgItemTextW(hDlg, IDC_PREF_FONT_SIZE, nb);
+          }
+          return TRUE;
+        }
+        case IDC_PREF_OK: {
+          HWND cbTheme = GetDlgItem(hDlg, IDC_PREF_THEME);
+          g_prefs_result.theme = (SendMessageW(cbTheme, CB_GETCURSEL, 0, 0) == 0)
+            ? Theme::SolarizedDark : Theme::SolarizedLight;
+
+          wchar_t buf[256];
+          GetDlgItemTextW(hDlg, IDC_PREF_FONT_NAME, buf, 256);
+          g_prefs_result.font_name = buf;
+
+          wchar_t szbuf[32];
+          GetDlgItemTextW(hDlg, IDC_PREF_FONT_SIZE, szbuf, 32);
+          g_prefs_result.font_size = szbuf[0] ? (float)_wtoi(szbuf) : g_font_size;
+
+          wchar_t sbbuf[32];
+          GetDlgItemTextW(hDlg, IDC_PREF_SCROLLBACK, sbbuf, 32);
+          g_prefs_result.scrollback = sbbuf[0] ? _wtoi(sbbuf) : SCROLLBACK_LINES;
+
+          HWND cbShell = GetDlgItem(hDlg, IDC_PREF_DEFAULT_SHELL);
+          int sel = (int)SendMessageW(cbShell, CB_GETCURSEL, 0, 0);
+          wchar_t shbuf[64] = {};
+          if (sel >= 0) SendMessageW(cbShell, CB_GETLBTEXT, sel, (LPARAM)shbuf);
+          g_prefs_result.default_shell = shbuf;
+
+          EndDialog(hDlg, IDC_PREF_OK);
+          return TRUE;
+        }
+        case IDC_PREF_CANCEL: EndDialog(hDlg, IDC_PREF_CANCEL); return TRUE;
+      }
+      return FALSE;
+
+    case WM_CLOSE:
+      EndDialog(hDlg, IDC_PREF_CANCEL);
+      return TRUE;
+  }
+  return FALSE;
+}
+
+static void do_preferences()
+{
+  std::vector<BYTE> tmpl = build_prefs_template();
+  INT_PTR r = DialogBoxIndirectParamW(GetModuleHandleW(NULL),
+    (LPCDLGTEMPLATEW)tmpl.data(), hwnd, prefs_dlg_proc, 0);
+  if (r != IDC_PREF_OK) return;
+
+  bool theme_changed = (g_prefs_result.theme != g_theme);
+  bool font_changed  = (g_prefs_result.font_name != g_font_name) ||
+                        (fabsf(g_prefs_result.font_size - g_font_size) > 0.01f);
+
+  if (theme_changed) {
+    g_theme = g_prefs_result.theme;
+    g_cur_fg = theme_fg(); g_cur_bg = theme_bg();
+    build_palette(g_theme);
+  }
+
+  if (font_changed && !g_prefs_result.font_name.empty() && g_prefs_result.font_size >= 6.0f) {
+    std::wstring of = g_font_name; float os = g_font_size;
+    rebuild_fmt(g_prefs_result.font_name, g_prefs_result.font_size);
+    if (!fmt) rebuild_fmt(of, os);
+    g_last_client_w = 0; g_last_client_h = 0;
+    pty_resize();
+  }
+
+  if (g_prefs_result.scrollback >= 100) SCROLLBACK_LINES = g_prefs_result.scrollback;
+
+  // Default shell only takes effect for the next launched session — it
+  // does not relaunch the shell already running in this window.
+  if (!g_prefs_result.default_shell.empty())
+    g_config.default_shell = g_prefs_result.default_shell;
+
+  update_statusbar();
+  config_save_now();
+  InvalidateRect(hwnd, NULL, FALSE);
 }
 
 // =====================================================
@@ -1343,6 +1878,8 @@ static HMENU create_menu()
   AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(file, MF_STRING, IDM_FILE_SAVELOG, L"Save Scrollback to Log...");
   AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(file, MF_STRING, IDM_FILE_PREFS,   L"Preferences...");
+  AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(file, MF_STRING, IDM_FILE_EXIT,    L"Exit");
   AppendMenuW(help, MF_STRING, IDM_HELP_ABOUT,   L"About");
   AppendMenuW(bar, MF_POPUP, (UINT_PTR)file, L"File");
@@ -1446,12 +1983,15 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         case IDM_CTX_CLEAR_SCROLLBACK: clear_scrollback(); return 0;
         case IDM_FILE_THEME_DARK:
           g_theme=Theme::SolarizedDark; g_cur_fg=theme_fg(); g_cur_bg=theme_bg();
-          build_palette(g_theme); update_statusbar(); InvalidateRect(h,NULL,FALSE); return 0;
+          build_palette(g_theme); update_statusbar(); InvalidateRect(h,NULL,FALSE);
+          config_save_now(); return 0;
         case IDM_FILE_THEME_LIGHT:
           g_theme=Theme::SolarizedLight; g_cur_fg=theme_fg(); g_cur_bg=theme_bg();
-          build_palette(g_theme); update_statusbar(); InvalidateRect(h,NULL,FALSE); return 0;
+          build_palette(g_theme); update_statusbar(); InvalidateRect(h,NULL,FALSE);
+          config_save_now(); return 0;
         case IDM_FILE_FONT:    do_font_picker();  return 0;
         case IDM_FILE_SAVELOG: save_scrollback(); return 0;
+        case IDM_FILE_PREFS:   do_preferences();  return 0;
         case IDM_FILE_EXIT:    DestroyWindow(h);  return 0;
         case IDM_HELP_ABOUT:
           MessageBoxW(h,
@@ -1711,8 +2251,18 @@ static void init_dw()
     dbg("  WARNING: No Nerd Font file found, using Courier New\n");
   }
 
-  dbg("  Calling rebuild_fmt with '%S'\n", rn.c_str());
-  rebuild_fmt(rn, 16.0f);
+  // A persisted font choice (miniterm.json, or the in-session Font picker)
+  // takes precedence over the auto-detected Nerd Font. The auto-detect
+  // path above is untouched — this only branches for an explicit override.
+  if (!g_config.font_name.empty()) {
+    dbg("  Config font override: '%S' size=%.1f\n",
+        g_config.font_name.c_str(), g_config.font_size);
+    rebuild_fmt(g_config.font_name, g_config.font_size);
+  }
+  if (!fmt) {
+    dbg("  Calling rebuild_fmt with '%S'\n", rn.c_str());
+    rebuild_fmt(rn, 16.0f);
+  }
   if (!fmt) {
     dbg("  rebuild_fmt failed, falling back to Courier New\n");
     rebuild_fmt(L"Courier New", 16.0f);
@@ -1797,6 +2347,18 @@ DWORD WINAPI reader(LPVOID)
 // =====================================================
 int wmain(int argc, wchar_t** argv)
 {
+  // File-based defaults load first; CLI flags (parse_args, below) override
+  // them, matching normal precedence of persisted config < explicit flags.
+  config_load(g_config);
+  g_theme          = str_to_theme(g_config.theme);
+  SCROLLBACK_LINES = g_config.scrollback_lines;
+  for (const auto& sp : g_config.shells) {
+    if (sp.name == g_config.default_shell) {
+      g_exe = sp.exe; g_args = sp.args; g_shellname = sp.name;
+      break;
+    }
+  }
+
   parse_args(argc, argv);
   debug_open();
 
@@ -1821,6 +2383,8 @@ int wmain(int argc, wchar_t** argv)
   while (GetMessageW(&msg, NULL, 0, 0)) {
     TranslateMessage(&msg); DispatchMessageW(&msg);
   }
+
+  config_save_now();
 
   clear_layout_cache();
   if (g_fontface) { g_fontface->Release(); g_fontface = nullptr; }
