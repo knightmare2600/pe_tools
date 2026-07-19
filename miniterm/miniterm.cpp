@@ -982,6 +982,26 @@ static std::wstring resolve_exe(const std::wstring& name)
 }
 
 // =====================================================
+// SHELL START DIRECTORY
+// CreateProcessW's lpCurrentDirectory defaults to NULL meaning
+// "inherit miniterm.exe's own cwd", which is often System32 if the
+// exe was launched without an explicit "Start in" folder. Resolve
+// %USERPROFILE% instead when it's set and actually exists -- WinPE
+// runs as SYSTEM by default and doesn't always have a meaningful
+// per-user profile, so this falls back to the old inherit behaviour
+// (empty string) rather than launching into a directory that isn't
+// there.
+// =====================================================
+static std::wstring resolve_start_dir()
+{
+  wchar_t buf[MAX_PATH] = {};
+  DWORD n = GetEnvironmentVariableW(L"USERPROFILE", buf, MAX_PATH);
+  if (n > 0 && n < MAX_PATH && GetFileAttributesW(buf) != INVALID_FILE_ATTRIBUTES)
+    return buf;
+  return L"";
+}
+
+// =====================================================
 // CLI PARSER
 // =====================================================
 static void parse_args(int argc, wchar_t** argv)
@@ -2669,9 +2689,11 @@ static bool launch_shell()
   // which then misreads the tail of its own exe path as a stray argument.
   std::wstring cmd = L"\"" + res + L"\" " + g_args;
   std::vector<wchar_t> mc(cmd.begin(), cmd.end()); mc.push_back(0);
+  std::wstring start_dir = resolve_start_dir();
   PROCESS_INFORMATION pi = {};
   BOOL ok = CreateProcessW(res.c_str(), mc.data(), NULL, NULL, FALSE,
-    EXTENDED_STARTUPINFO_PRESENT, NULL, NULL, &si.StartupInfo, &pi);
+    EXTENDED_STARTUPINFO_PRESENT, NULL,
+    start_dir.empty() ? NULL : start_dir.c_str(), &si.StartupInfo, &pi);
 
   DeleteProcThreadAttributeList(si.lpAttributeList);
   HeapFree(GetProcessHeap(), 0, si.lpAttributeList);
