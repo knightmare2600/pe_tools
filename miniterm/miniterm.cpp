@@ -1642,6 +1642,12 @@ static INT_PTR CALLBACK prefs_dlg_proc(HWND hDlg, UINT msg, WPARAM wp, LPARAM)
   return FALSE;
 }
 
+static void switch_shell(const ShellPreset& sp);
+static void new_session(const ShellPreset& sp);
+static void close_session(int idx, bool already_dead);
+static void switch_to_session(int idx);
+static void rebuild_tab_ui();
+
 static void do_preferences()
 {
   std::vector<BYTE> tmpl = build_prefs_template();
@@ -2055,12 +2061,6 @@ static HMENU create_menu()
   AppendMenuW(bar, MF_POPUP, (UINT_PTR)help, L"Help");
   return bar;
 }
-
-static void switch_shell(const ShellPreset& sp);
-static void new_session(const ShellPreset& sp);
-static void close_session(int idx, bool already_dead);
-static void switch_to_session(int idx);
-static void rebuild_tab_ui();
 
 // =====================================================
 // WINDOW PROC
