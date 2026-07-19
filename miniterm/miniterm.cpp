@@ -1302,7 +1302,13 @@ static void config_sync_from_globals()
   g_config.font_name        = g_font_name;
   g_config.font_size        = g_font_size;
   g_config.scrollback_lines = SCROLLBACK_LINES;
-  g_config.default_shell    = g_shellname;
+  // default_shell deliberately NOT synced from g_shellname here: it's a
+  // preference about which shell *future* launches use, set explicitly
+  // via the Preferences dialog. g_shellname is whatever the CURRENT
+  // session happens to be running right now -- syncing from it meant
+  // every config_save_now() call (theme change, font change, tab
+  // switch, exit, ...) silently overwrote the user's chosen default
+  // back to whatever shell was already running.
 }
 
 static void config_save_now()
