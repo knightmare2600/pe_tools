@@ -538,7 +538,11 @@ static void erase_line_tail()
   if (cy < H && g_row_max_cx[cy] > cx)
     for (int x = cx; x <= g_row_max_cx[cy] && x < W; x++)
       g_screen[cy][x] = Cell{ ' ', g_cur_fg, theme_bg(), false };
-  if (cy < H) g_row_max_cx[cy] = 0;
+  // Only shrink the tracked content bound to what's actually left of cx —
+  // forcing it to 0 unconditionally lost track of untouched content to the
+  // left of the cursor, causing later same-row redraws to under-clear and
+  // leave stale glyphs behind.
+  if (cy < H) g_row_max_cx[cy] = (cx == 0) ? 0 : min(g_row_max_cx[cy], cx - 1);
 }
 
 // =====================================================
