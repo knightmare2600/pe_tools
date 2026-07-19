@@ -14,6 +14,7 @@
 #include <deque>
 #include <unordered_map>
 #include <algorithm>
+#include <memory>
 #include <shlwapi.h>
 
 #pragma comment(lib, "d2d1.lib")
@@ -115,6 +116,13 @@ static int   SCROLLBACK_LINES = 1000;
 static float CELL_W           = 9.6f;
 static float CELL_H           = 20.0f;
 
+// Fixed tab-strip height in pixels. Queried dynamically it would need at
+// least one tab item inserted first, but the first pty_resize() runs
+// before any session/tab exists -- a fixed constant sidesteps that
+// bootstrapping order problem. Matches native tab control height closely
+// enough at default system font/DPI.
+static const int kTabStripH = 24;
+
 // =====================================================
 // DEBUG
 // =====================================================
@@ -170,6 +178,9 @@ static void debug_open()
 #define IDC_PREF_DEFAULT_SHELL   4006
 #define IDC_PREF_OK              4007
 #define IDC_PREF_CANCEL          4008
+#define IDM_TAB_CLOSE            6001
+#define WM_APP_SESSION_ENDED     (WM_APP + 1)
+#define IDC_TABCTRL              7001
 
 // =====================================================
 // THEME + PALETTE
@@ -271,6 +282,45 @@ static HANDLE               g_reader_thread   = nullptr;
 static volatile bool         g_shell_switching = false;
 
 // =====================================================
+// SESSIONS (tabs)
+//
+// Only the ACTIVE session's reader thread ever runs. The bare globals
+// above (g_screen, cx, cy, g_hpc, hInW, hOutR, g_exe, ...) always mean
+// "whichever session is active right now" -- render(), VtProcessor,
+// screen_clear_region() etc. all keep operating on them completely
+// unchanged. Switching tabs pauses the outgoing session's reader via
+// CancelIoEx (its handles stay open, NOT closed) and captures the live
+// globals into its Session struct; switching back restores them and
+// resumes reading. A backgrounded shell keeps running -- its output
+// just queues in the OS pipe buffer until the tab is revisited.
+// =====================================================
+struct Session {
+  std::wstring name, shellname, exe, args;
+
+  std::vector<std::vector<Cell>> screen;
+  std::deque<std::vector<Cell>>  history;
+  std::vector<int>               row_max_cx;
+  int  view_top  = 0;
+  bool at_bottom = true;
+
+  int     cx = 0, cy = 0, saved_cx = 0, saved_cy = 0;
+  bool    cursor_visible = true;
+  uint8_t cur_fg = 7, cur_bg = 0;
+
+  bool sel_active = false, sel_dragging = false;
+  int  sel_r0 = 0, sel_c0 = 0, sel_r1 = 0, sel_c1 = 0;
+
+  HPCON               hpc      = nullptr;
+  HANDLE               hInR = nullptr, hInW = nullptr, hOutR = nullptr, hOutW = nullptr;
+  PROCESS_INFORMATION  child_pi = {};
+  HANDLE               reader_thread = nullptr;
+};
+
+static std::vector<std::unique_ptr<Session>> g_sessions;
+static int  g_active_session   = -1;
+static int  g_next_session_num = 1;
+
+// =====================================================
 // DIRECTWRITE
 // =====================================================
 static IDWriteFactory*        dw          = nullptr;
@@ -298,6 +348,7 @@ static const size_t k_layout_cache_max = 8192;
 static HWND hwnd        = nullptr;
 static HWND g_statusbar = nullptr;
 static HWND g_scrollbar = nullptr;
+static HWND g_tabctrl   = nullptr;
 
 // =====================================================
 // SHELL CONFIG
@@ -1349,7 +1400,7 @@ static const std::vector<Cell>& get_view_row(int view_row)
 static void pixel_to_cell(int px, int py, int& row, int& col)
 {
   col = max(0, min(W-1, (int)(px / CELL_W)));
-  row = max(0, min(H-1, (int)(py / CELL_H)));
+  row = max(0, min(H-1, (int)((py - kTabStripH) / CELL_H)));
 }
 
 // =====================================================
@@ -1646,6 +1697,10 @@ static void render()
 
   rt->BeginDraw();
   rt->Clear(g_palette[theme_bg()]);
+  // Shift all terminal content down below the tab strip -- that top
+  // strip is painted over by the tab control child window regardless,
+  // this just keeps the grid's row 0 visually aligned under it.
+  rt->SetTransform(D2D1::Matrix3x2F::Translation(0.0f, (float)kTabStripH));
 
   ID2D1SolidColorBrush* fg_brush = nullptr;
   ID2D1SolidColorBrush* bg_brush = nullptr;
@@ -1762,7 +1817,9 @@ static void pty_resize()
   int sb_h = 0, scr_w = GetSystemMetrics(SM_CXVSCROLL);
   if (g_statusbar) { RECT s; GetWindowRect(g_statusbar, &s); sb_h = s.bottom - s.top; }
 
-  int client_h = (rc.bottom - rc.top) - sb_h;
+  if (g_tabctrl) SetWindowPos(g_tabctrl, NULL, 0, 0, rc.right - rc.left, kTabStripH, SWP_NOZORDER);
+
+  int client_h = (rc.bottom - rc.top) - sb_h - kTabStripH;
   int client_w = (rc.right  - rc.left) - scr_w;
 
   if (client_w == g_last_client_w && client_h == g_last_client_h) return;
@@ -1774,7 +1831,7 @@ static void pty_resize()
   EnterCriticalSection(&g_cs); grid_resize(newW, newH); LeaveCriticalSection(&g_cs);
 
   if (g_hpc) { COORD sz = {(SHORT)newW,(SHORT)newH}; ResizePseudoConsole(g_hpc, sz); }
-  if (g_scrollbar) SetWindowPos(g_scrollbar, NULL, rc.right-scr_w, 0, scr_w, client_h, SWP_NOZORDER);
+  if (g_scrollbar) SetWindowPos(g_scrollbar, NULL, rc.right-scr_w, kTabStripH, scr_w, client_h, SWP_NOZORDER);
   if (rt) rt->Resize(D2D1::SizeU(rc.right-rc.left, rc.bottom-rc.top));
   update_scrollbar();
 
@@ -1870,7 +1927,8 @@ static void show_context_menu(int sx, int sy)
 // =====================================================
 // MENU BAR
 // =====================================================
-static HMENU g_shell_menu = nullptr;
+static HMENU g_shell_menu  = nullptr;
+static int   g_ctx_tab_idx = -1;
 
 static HMENU create_menu()
 {
@@ -1883,7 +1941,7 @@ static HMENU create_menu()
   }
   AppendMenuW(theme, MF_STRING, IDM_FILE_THEME_DARK,  L"Solarized Dark");
   AppendMenuW(theme, MF_STRING, IDM_FILE_THEME_LIGHT, L"Solarized Light");
-  AppendMenuW(file, MF_STRING|MF_GRAYED, IDM_FILE_NEWTAB,  L"New Tab\t(coming soon)");
+  AppendMenuW(file, MF_STRING, IDM_FILE_NEWTAB,  L"New Tab");
   AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(file, MF_POPUP, (UINT_PTR)g_shell_menu, L"Shell");
   AppendMenuW(file, MF_POPUP, (UINT_PTR)theme, L"Theme");
@@ -1902,6 +1960,10 @@ static HMENU create_menu()
 }
 
 static void switch_shell(const ShellPreset& sp);
+static void new_session(const ShellPreset& sp);
+static void close_session(int idx, bool already_dead);
+static void switch_to_session(int idx);
+static void rebuild_tab_ui();
 
 // =====================================================
 // WINDOW PROC
@@ -2014,6 +2076,17 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         case IDM_FILE_SAVELOG: save_scrollback(); return 0;
         case IDM_FILE_PREFS:   do_preferences();  return 0;
         case IDM_FILE_EXIT:    DestroyWindow(h);  return 0;
+        case IDM_FILE_NEWTAB: {
+          const ShellPreset* dflt = g_config.shells.empty() ? nullptr : &g_config.shells[0];
+          for (const auto& sp : g_config.shells)
+            if (sp.name == g_config.default_shell) { dflt = &sp; break; }
+          if (dflt) new_session(*dflt);
+          return 0;
+        }
+        case IDM_TAB_CLOSE:
+          if (g_ctx_tab_idx >= 0) close_session(g_ctx_tab_idx, false);
+          g_ctx_tab_idx = -1;
+          return 0;
         case IDM_HELP_ABOUT:
           MessageBoxW(h,
             L"miniterm v2.8\nConPTY WinPE Terminal\n\n"
@@ -2022,6 +2095,36 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
             L"About miniterm", MB_OK|MB_ICONINFORMATION);
           return 0;
       }
+      return 0;
+
+    case WM_NOTIFY: {
+      NMHDR* nm = (NMHDR*)l;
+      if (nm->hwndFrom == g_tabctrl) {
+        if (nm->code == TCN_SELCHANGE) {
+          int idx = (int)SendMessageW(g_tabctrl, TCM_GETCURSEL, 0, 0);
+          switch_to_session(idx);
+          return 0;
+        }
+        if (nm->code == NM_RCLICK) {
+          POINT pt; GetCursorPos(&pt);
+          POINT client = pt; ScreenToClient(g_tabctrl, &client);
+          TCHITTESTINFO hit = {}; hit.pt = client;
+          int idx = (int)SendMessageW(g_tabctrl, TCM_HITTEST, 0, (LPARAM)&hit);
+          if (idx >= 0) {
+            g_ctx_tab_idx = idx;
+            HMENU menu = CreatePopupMenu();
+            AppendMenuW(menu, MF_STRING, IDM_TAB_CLOSE, L"Close Tab");
+            TrackPopupMenu(menu, TPM_LEFTALIGN | TPM_RIGHTBUTTON, pt.x, pt.y, 0, h, nullptr);
+            DestroyMenu(menu);
+          }
+          return 0;
+        }
+      }
+      return 0;
+    }
+
+    case WM_APP_SESSION_ENDED:
+      close_session((int)w, true);
       return 0;
 
     case WM_DESTROY:
@@ -2036,7 +2139,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
 // =====================================================
 static void init_window()
 {
-  INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_BAR_CLASSES };
+  INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_BAR_CLASSES | ICC_TAB_CLASSES };
   InitCommonControlsEx(&icc);
 
   WNDCLASSW wc = {};
@@ -2049,6 +2152,10 @@ static void init_window()
   hwnd = CreateWindowW(L"MINITERM", L"miniterm",
     WS_OVERLAPPEDWINDOW, 100, 100, 1000, 700,
     NULL, create_menu(), wc.hInstance, NULL);
+
+  g_tabctrl = CreateWindowW(WC_TABCONTROLW, nullptr,
+    WS_CHILD|WS_VISIBLE|TCS_FOCUSNEVER,
+    0, 0, 0, 0, hwnd, (HMENU)(UINT_PTR)IDC_TABCTRL, wc.hInstance, nullptr);
 
   g_statusbar = CreateWindowW(L"msctls_statusbar32", nullptr,
     WS_CHILD|WS_VISIBLE|SBARS_SIZEGRIP,
@@ -2365,9 +2472,15 @@ DWORD WINAPI reader(LPVOID)
     LeaveCriticalSection(&g_cs);
     update_scrollbar(); update_statusbar(); InvalidateRect(hwnd, NULL, FALSE);
   }
-  // A deliberate shell switch tears this pipe down on purpose (see
-  // switch_shell()) -- don't close the whole app in that case.
-  if (!g_shell_switching) PostMessageW(hwnd, WM_CLOSE, 0, 0);
+  // Three ways this loop can end:
+  //  1. Deliberate shell switch (switch_shell) closed the pipe on purpose.
+  //  2. Deliberate tab backgrounding (session_pause_reader) cancelled the
+  //     pending ReadFile via CancelIoEx without closing anything -- the
+  //     handle stays valid so a later reader thread can resume from it.
+  //  3. The child process actually exited -- a genuine session end.
+  // Only case 3 should tell the UI thread a session died.
+  if (g_shell_switching || GetLastError() == ERROR_OPERATION_ABORTED) return 0;
+  PostMessageW(hwnd, WM_APP_SESSION_ENDED, (WPARAM)g_active_session, 0);
   return 0;
 }
 
@@ -2425,6 +2538,198 @@ static void switch_shell(const ShellPreset& sp)
 }
 
 // =====================================================
+// SESSION CAPTURE / RESTORE
+// Move the live globals into/out of a Session struct. See the
+// "SESSIONS (tabs)" comment near the Session struct definition for
+// why this swap approach was chosen over threading session state
+// through every function.
+// =====================================================
+static void session_capture(Session& s)
+{
+  s.screen = g_screen; s.history = g_history; s.row_max_cx = g_row_max_cx;
+  s.view_top = g_view_top; s.at_bottom = g_at_bottom;
+  s.cx = cx; s.cy = cy; s.saved_cx = saved_cx; s.saved_cy = saved_cy;
+  s.cursor_visible = g_cursor_visible; s.cur_fg = g_cur_fg; s.cur_bg = g_cur_bg;
+  s.sel_active = g_sel_active; s.sel_dragging = g_sel_dragging;
+  s.sel_r0 = g_sel_r0; s.sel_c0 = g_sel_c0; s.sel_r1 = g_sel_r1; s.sel_c1 = g_sel_c1;
+  s.hpc = g_hpc; s.hInR = hInR; s.hInW = hInW; s.hOutR = hOutR; s.hOutW = hOutW;
+  s.child_pi = g_child_pi; s.reader_thread = g_reader_thread;
+  s.exe = g_exe; s.args = g_args; s.shellname = g_shellname;
+}
+
+static void session_restore(const Session& s)
+{
+  g_screen = s.screen; g_history = s.history; g_row_max_cx = s.row_max_cx;
+  g_view_top = s.view_top; g_at_bottom = s.at_bottom;
+  cx = s.cx; cy = s.cy; saved_cx = s.saved_cx; saved_cy = s.saved_cy;
+  g_cursor_visible = s.cursor_visible; g_cur_fg = s.cur_fg; g_cur_bg = s.cur_bg;
+  g_sel_active = s.sel_active; g_sel_dragging = s.sel_dragging;
+  g_sel_r0 = s.sel_r0; g_sel_c0 = s.sel_c0; g_sel_r1 = s.sel_r1; g_sel_c1 = s.sel_c1;
+  g_hpc = s.hpc; hInR = s.hInR; hInW = s.hInW; hOutR = s.hOutR; hOutW = s.hOutW;
+  g_child_pi = s.child_pi; g_reader_thread = s.reader_thread;
+  g_exe = s.exe; g_args = s.args; g_shellname = s.shellname;
+}
+
+// Cancels the active session's pending ReadFile without closing hOutR,
+// so its backlog keeps accumulating in the OS pipe and a later reader
+// thread can resume from the same handle.
+static void session_pause_reader()
+{
+  if (hOutR) CancelIoEx(hOutR, NULL);
+  if (g_reader_thread) {
+    WaitForSingleObject(g_reader_thread, 2000);
+    CloseHandle(g_reader_thread);
+    g_reader_thread = nullptr;
+  }
+}
+
+static void session_resume_reader()
+{
+  if (hOutR && !g_reader_thread)
+    g_reader_thread = CreateThread(NULL, 0, reader, NULL, 0, NULL);
+}
+
+// =====================================================
+// TAB STRIP UI
+// =====================================================
+static void rebuild_tab_ui()
+{
+  if (!g_tabctrl) return;
+  SendMessageW(g_tabctrl, TCM_DELETEALLITEMS, 0, 0);
+  for (size_t i = 0; i < g_sessions.size(); i++) {
+    TCITEMW ti = {};
+    ti.mask = TCIF_TEXT;
+    ti.pszText = (LPWSTR)g_sessions[i]->name.c_str();
+    SendMessageW(g_tabctrl, TCM_INSERTITEMW, i, (LPARAM)&ti);
+  }
+  if (g_active_session >= 0)
+    SendMessageW(g_tabctrl, TCM_SETCURSEL, (WPARAM)g_active_session, 0);
+}
+
+// =====================================================
+// SWITCH / CREATE / CLOSE SESSIONS (tabs)
+// =====================================================
+static void switch_to_session(int idx)
+{
+  if (idx < 0 || idx >= (int)g_sessions.size() || idx == g_active_session) return;
+
+  if (g_active_session >= 0) {
+    session_pause_reader();
+    session_capture(*g_sessions[g_active_session]);
+  }
+
+  g_active_session = idx;
+  session_restore(*g_sessions[idx]);
+
+  // The window may have been resized while this session was backgrounded
+  // (only the then-active session's grid/pty got resized at the time) --
+  // reconcile this session's screen buffer and PTY to the current W x H.
+  EnterCriticalSection(&g_cs);
+  bool stale = g_screen.empty() || (int)g_screen.size() != H ||
+               (int)g_screen[0].size() != W;
+  if (stale) grid_resize(W, H);
+  LeaveCriticalSection(&g_cs);
+  if (g_hpc) { COORD sz = {(SHORT)W, (SHORT)H}; ResizePseudoConsole(g_hpc, sz); }
+
+  session_resume_reader();
+
+  if (g_tabctrl) SendMessageW(g_tabctrl, TCM_SETCURSEL, (WPARAM)idx, 0);
+  update_statusbar();
+  update_scrollbar();
+  InvalidateRect(hwnd, NULL, FALSE);
+}
+
+static void new_session(const ShellPreset& sp)
+{
+  auto s = std::make_unique<Session>();
+  wchar_t nb[64];
+  wsprintfW(nb, L"%s #%d", sp.name.c_str(), g_next_session_num++);
+  s->name      = nb;
+  s->exe       = sp.exe;
+  s->args      = sp.args;
+  s->shellname = sp.name;
+  s->screen.assign(H, std::vector<Cell>(W, Cell{ ' ', theme_fg(), theme_bg(), false }));
+  s->row_max_cx.assign(H, 0);
+
+  g_sessions.push_back(std::move(s));
+  int new_idx = (int)g_sessions.size() - 1;
+
+  if (g_active_session >= 0) {
+    session_pause_reader();
+    session_capture(*g_sessions[g_active_session]);
+  }
+
+  g_active_session = new_idx;
+  session_restore(*g_sessions[new_idx]);
+
+  if (launch_shell())
+    g_reader_thread = CreateThread(NULL, 0, reader, NULL, 0, NULL);
+
+  rebuild_tab_ui();
+  update_statusbar();
+  InvalidateRect(hwnd, NULL, FALSE);
+}
+
+// already_dead: true when called because the child process exited on its
+// own (reader thread already returned) -- false when the user explicitly
+// asked to close a still-running tab, which must tear the shell down.
+static void close_session(int idx, bool already_dead)
+{
+  if (idx < 0 || idx >= (int)g_sessions.size()) return;
+
+  if (idx == g_active_session) {
+    if (!already_dead) {
+      if (g_reader_thread) {
+        if (hOutR) CancelIoEx(hOutR, NULL);
+        WaitForSingleObject(g_reader_thread, 2000);
+        CloseHandle(g_reader_thread);
+        g_reader_thread = nullptr;
+      }
+      if (g_child_pi.hProcess) {
+        TerminateProcess(g_child_pi.hProcess, 0);
+        WaitForSingleObject(g_child_pi.hProcess, 2000);
+      }
+    }
+    // Regardless of already_dead, the pseudoconsole handle itself is done
+    // and must be released (ClosePseudoConsole is safe to call whether or
+    // not the hosted process has already exited).
+    if (g_hpc) { ClosePseudoConsole(g_hpc); g_hpc = nullptr; }
+    if (g_child_pi.hProcess) { CloseHandle(g_child_pi.hProcess); CloseHandle(g_child_pi.hThread); }
+    g_child_pi = PROCESS_INFORMATION{};
+    if (hInW)  { CloseHandle(hInW);  hInW  = nullptr; }
+    if (hOutR) { CloseHandle(hOutR); hOutR = nullptr; }
+    if (g_reader_thread) { CloseHandle(g_reader_thread); g_reader_thread = nullptr; }
+  } else {
+    // Background tab: no live reader thread to stop, just release its
+    // handles and (if still running) its child process.
+    Session& s = *g_sessions[idx];
+    if (s.child_pi.hProcess) {
+      TerminateProcess(s.child_pi.hProcess, 0);
+      WaitForSingleObject(s.child_pi.hProcess, 2000);
+      CloseHandle(s.child_pi.hProcess);
+      CloseHandle(s.child_pi.hThread);
+    }
+    if (s.hInW)  CloseHandle(s.hInW);
+    if (s.hOutR) CloseHandle(s.hOutR);
+    if (s.hpc)   ClosePseudoConsole(s.hpc);
+  }
+
+  bool was_active = (idx == g_active_session);
+  g_sessions.erase(g_sessions.begin() + idx);
+
+  if (g_sessions.empty()) { DestroyWindow(hwnd); return; }
+
+  if (was_active) {
+    g_active_session = -1;
+    switch_to_session(min(idx, (int)g_sessions.size() - 1));
+  } else if (idx < g_active_session) {
+    g_active_session--;
+  }
+
+  rebuild_tab_ui();
+}
+
+// =====================================================
 // MAIN
 // =====================================================
 int wmain(int argc, wchar_t** argv)
@@ -2448,18 +2753,14 @@ int wmain(int argc, wchar_t** argv)
   InitializeCriticalSection(&g_cache_cs);
   build_palette(g_theme);
 
-  EnterCriticalSection(&g_cs);
-  g_screen.assign(H, std::vector<Cell>(W, Cell{' ', theme_fg(), theme_bg(), false}));
-  g_row_max_cx.assign(H, 0);
-  g_history.clear(); g_view_top = 0; g_at_bottom = true; cx = 0; cy = 0;
-  LeaveCriticalSection(&g_cs);
-
   CoInitialize(NULL);
   init_window();
   init_dw();
 
-  if (launch_shell())
-    g_reader_thread = CreateThread(NULL, 0, reader, NULL, 0, NULL);
+  // The first tab, built from whatever shell config/CLI resolved above --
+  // new_session() establishes the screen/history/cursor state itself, so
+  // no separate manual g_screen init is needed here.
+  new_session(ShellPreset{ g_shellname, g_exe, g_args });
 
   MSG msg;
   while (GetMessageW(&msg, NULL, 0, 0)) {
@@ -2468,11 +2769,24 @@ int wmain(int argc, wchar_t** argv)
 
   config_save_now();
 
-  if (g_child_pi.hProcess) {
-    CloseHandle(g_child_pi.hProcess);
-    CloseHandle(g_child_pi.hThread);
-    g_child_pi = PROCESS_INFORMATION{};
+  // The active session's real handles live in the bare globals below, not
+  // in its Session struct (that copy is only refreshed by session_capture,
+  // which runs on backgrounding -- for whichever tab is active right now
+  // its struct fields are a stale echo of a past state, not a live alias,
+  // EXCEPT the values happen to still match if it was ever backgrounded
+  // and reactivated. Skip it here to avoid closing the same handle twice.
+  for (int i = 0; i < (int)g_sessions.size(); i++) {
+    if (i == g_active_session) continue;
+    Session& s = *g_sessions[i];
+    if (s.child_pi.hProcess) { TerminateProcess(s.child_pi.hProcess, 0); CloseHandle(s.child_pi.hProcess); CloseHandle(s.child_pi.hThread); }
+    if (s.hInW)  CloseHandle(s.hInW);
+    if (s.hOutR) CloseHandle(s.hOutR);
+    if (s.hpc)   ClosePseudoConsole(s.hpc);
   }
+  if (g_child_pi.hProcess) { TerminateProcess(g_child_pi.hProcess, 0); CloseHandle(g_child_pi.hProcess); CloseHandle(g_child_pi.hThread); }
+  if (hInW)  CloseHandle(hInW);
+  if (hOutR) CloseHandle(hOutR);
+  if (g_hpc) ClosePseudoConsole(g_hpc);
   if (g_reader_thread) { CloseHandle(g_reader_thread); g_reader_thread = nullptr; }
 
   clear_layout_cache();
