@@ -1,0 +1,43 @@
+name: Manual Build (miniterm)
+
+# Manual trigger ONLY — no push/pull_request triggers.
+# Run from the Actions tab: "Manual Build (miniterm)" -> "Run workflow".
+on:
+  workflow_dispatch: {}
+
+defaults:
+  run:
+    working-directory: miniterm
+
+jobs:
+  build:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC (${{ matrix.arch }})
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.arch }}
+
+      - name: Compile resources
+        shell: cmd
+        run: rc.exe /fo miniterm.res miniterm.rc
+
+      - name: Build miniterm-${{ matrix.arch }}.exe
+        shell: cmd
+        run: >
+          cl miniterm.cpp miniterm.res /EHsc /std:c++17 /MT
+          user32.lib kernel32.lib gdi32.lib d2d1.lib dwrite.lib ole32.lib shlwapi.lib comdlg32.lib comctl32.lib
+          /link /MANIFEST:EMBED /MANIFESTINPUT:miniterm.exe.manifest /OUT:miniterm-${{ matrix.arch }}.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: miniterm-${{ matrix.arch }}
+          path: miniterm/miniterm-${{ matrix.arch }}.exe

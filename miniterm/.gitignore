@@ -1,0 +1,4 @@
+*.obj
+*.res
+miniterm_debug.txt
+miniterm.json
