@@ -2139,6 +2139,8 @@ static void show_context_menu(int sx, int sy)
 static HMENU g_shell_menu  = nullptr;
 static HMENU g_newtab_menu = nullptr;
 static int   g_ctx_tab_idx = -1;
+static bool  g_tab_dragging = false;
+static int   g_tab_drag_idx = -1;
 
 static HMENU create_menu()
 {
@@ -2353,6 +2355,9 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
   return DefWindowProcW(h, m, w, l);
 }
 
+static LRESULT CALLBACK tabctrl_subclass(HWND hTab, UINT msg, WPARAM wp, LPARAM lp,
+                                          UINT_PTR, DWORD_PTR);
+
 // =====================================================
 // WINDOW INIT
 // =====================================================
@@ -2380,6 +2385,7 @@ static void init_window()
   g_tabctrl = CreateWindowW(WC_TABCONTROLW, nullptr,
     WS_CHILD|WS_VISIBLE|TCS_FOCUSNEVER,
     0, 0, 0, 0, hwnd, (HMENU)(UINT_PTR)IDC_TABCTRL, wc.hInstance, nullptr);
+  SetWindowSubclass(g_tabctrl, tabctrl_subclass, 1, 0);
 
   g_statusbar = CreateWindowW(L"msctls_statusbar32", nullptr,
     WS_CHILD|WS_VISIBLE|SBARS_SIZEGRIP,
@@ -2841,6 +2847,64 @@ static void rebuild_tab_ui()
   }
   if (g_active_session >= 0)
     SendMessageW(g_tabctrl, TCM_SETCURSEL, (WPARAM)g_active_session, 0);
+}
+
+// Moves the session at `from` to occupy index `to`, keeping
+// g_active_session pointing at the same logical session regardless of
+// where it ends up.
+static void reorder_session(int from, int to)
+{
+  if (from < 0 || to < 0 || from >= (int)g_sessions.size() ||
+      to >= (int)g_sessions.size() || from == to) return;
+
+  std::unique_ptr<Session> moved = std::move(g_sessions[from]);
+  g_sessions.erase(g_sessions.begin() + from);
+  g_sessions.insert(g_sessions.begin() + to, std::move(moved));
+
+  if (g_active_session == from) {
+    g_active_session = to;
+  } else if (from < g_active_session && to >= g_active_session) {
+    g_active_session--;
+  } else if (from > g_active_session && to <= g_active_session) {
+    g_active_session++;
+  }
+
+  rebuild_tab_ui();
+}
+
+// Subclasses the native tab control to add click-and-drag reordering,
+// which SysTabControl32 doesn't support natively. Only augments --
+// every branch falls through to DefSubclassProc so ordinary click-to-
+// select (and everything else the control already does) keeps working
+// unchanged.
+static LRESULT CALLBACK tabctrl_subclass(HWND hTab, UINT msg, WPARAM wp, LPARAM lp,
+                                          UINT_PTR, DWORD_PTR)
+{
+  if (msg == WM_LBUTTONDOWN) {
+    TCHITTESTINFO hit = {};
+    hit.pt.x = LOWORD(lp); hit.pt.y = HIWORD(lp);
+    int idx = (int)SendMessageW(hTab, TCM_HITTEST, 0, (LPARAM)&hit);
+    if (idx >= 0) {
+      g_tab_dragging = true;
+      g_tab_drag_idx = idx;
+      SetCapture(hTab);
+    }
+  } else if (msg == WM_MOUSEMOVE) {
+    if (g_tab_dragging) {
+      TCHITTESTINFO hit = {};
+      hit.pt.x = LOWORD(lp); hit.pt.y = HIWORD(lp);
+      int over = (int)SendMessageW(hTab, TCM_HITTEST, 0, (LPARAM)&hit);
+      if (over >= 0 && over != g_tab_drag_idx) {
+        reorder_session(g_tab_drag_idx, over);
+        g_tab_drag_idx = over;
+      }
+    }
+  } else if (msg == WM_LBUTTONUP) {
+    if (g_tab_dragging) { g_tab_dragging = false; ReleaseCapture(); }
+  } else if (msg == WM_CAPTURECHANGED) {
+    g_tab_dragging = false;  // capture lost some other way -- don't get stuck
+  }
+  return DefSubclassProc(hTab, msg, wp, lp);
 }
 
 // =====================================================
