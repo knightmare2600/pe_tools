@@ -15,29 +15,39 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: [x64, arm64]
+        include:
+          # msvc_arch is the vcvarsall host_target pair; windows-latest
+          # runners are x64 hardware, so arm64 output needs the x64-hosted
+          # cross toolset (bin\HostX64\arm64), not the native arm64 host
+          # toolset (bin\HostARM64\ARM64) -- the latter can't execute on
+          # x64 hardware at all ("this version of rc.exe is not
+          # compatible with the version of Windows you're running").
+          - out_arch: x64
+            msvc_arch: x64
+          - out_arch: arm64
+            msvc_arch: x64_arm64
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup MSVC (${{ matrix.arch }})
+      - name: Setup MSVC (${{ matrix.msvc_arch }})
         uses: ilammy/msvc-dev-cmd@v1
         with:
-          arch: ${{ matrix.arch }}
+          arch: ${{ matrix.msvc_arch }}
 
       - name: Compile resources
         shell: cmd
         run: rc.exe /fo miniterm.res miniterm.rc
 
-      - name: Build miniterm-${{ matrix.arch }}.exe
+      - name: Build miniterm-${{ matrix.out_arch }}.exe
         shell: cmd
         run: >
           cl miniterm.cpp miniterm.res /EHsc /std:c++17 /MT
           user32.lib kernel32.lib gdi32.lib d2d1.lib dwrite.lib ole32.lib shlwapi.lib comdlg32.lib comctl32.lib
-          /link /MANIFEST:EMBED /MANIFESTINPUT:miniterm.exe.manifest /OUT:miniterm-${{ matrix.arch }}.exe
+          /link /MANIFEST:EMBED /MANIFESTINPUT:miniterm.exe.manifest /OUT:miniterm-${{ matrix.out_arch }}.exe
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: miniterm-${{ matrix.arch }}
-          path: miniterm/miniterm-${{ matrix.arch }}.exe
+          name: miniterm-${{ matrix.out_arch }}
+          path: miniterm/miniterm-${{ matrix.out_arch }}.exe
