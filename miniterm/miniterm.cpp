@@ -163,7 +163,6 @@ static void debug_open()
 // =====================================================
 // MENU / CONTEXT MENU / TIMER IDs
 // =====================================================
-#define IDM_FILE_NEWTAB          1001
 #define IDM_FILE_THEME_DARK      1002
 #define IDM_FILE_THEME_LIGHT     1003
 #define IDM_FILE_SAVELOG         1004
@@ -183,6 +182,7 @@ static void debug_open()
 #define IDC_PREF_SCROLLBACK      4005
 #define IDM_SHELL_BASE           5000
 #define IDM_SHELL_MAX            32
+#define IDM_NEWTAB_BASE          9500
 #define IDC_PREF_DEFAULT_SHELL   4006
 #define IDC_PREF_OK              4007
 #define IDC_PREF_CANCEL          4008
@@ -2041,6 +2041,7 @@ static void show_context_menu(int sx, int sy)
 // MENU BAR
 // =====================================================
 static HMENU g_shell_menu  = nullptr;
+static HMENU g_newtab_menu = nullptr;
 static int   g_ctx_tab_idx = -1;
 
 static HMENU create_menu()
@@ -2052,10 +2053,13 @@ static HMENU create_menu()
     UINT flags = MF_STRING | ((g_config.shells[i].name == g_shellname) ? MF_CHECKED : 0);
     AppendMenuW(g_shell_menu, flags, IDM_SHELL_BASE + (UINT)i, g_config.shells[i].name.c_str());
   }
+  g_newtab_menu = CreatePopupMenu();
+  for (size_t i = 0; i < g_config.shells.size() && i < IDM_SHELL_MAX; i++)
+    AppendMenuW(g_newtab_menu, MF_STRING, IDM_NEWTAB_BASE + (UINT)i, g_config.shells[i].name.c_str());
   AppendMenuW(theme, MF_STRING, IDM_FILE_THEME_DARK,  L"Solarized Dark");
   AppendMenuW(theme, MF_STRING, IDM_FILE_THEME_LIGHT, L"Solarized Light");
 
-  AppendMenuW(file, MF_STRING, IDM_FILE_NEWTAB,  L"New Tab");
+  AppendMenuW(file, MF_POPUP, (UINT_PTR)g_newtab_menu, L"New");
   AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(file, MF_STRING, IDM_FILE_SAVELOG, L"Save Scrollback to Log...");
   AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
@@ -2170,6 +2174,11 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (idx < g_config.shells.size()) switch_shell(g_config.shells[idx]);
         return 0;
       }
+      if (LOWORD(w) >= IDM_NEWTAB_BASE && LOWORD(w) < IDM_NEWTAB_BASE + IDM_SHELL_MAX) {
+        size_t idx = LOWORD(w) - IDM_NEWTAB_BASE;
+        if (idx < g_config.shells.size()) new_session(g_config.shells[idx]);
+        return 0;
+      }
       switch (LOWORD(w)) {
         case IDM_CTX_COPY:
           if (g_sel_active) { copy_selection_to_clipboard(); g_sel_active=false; InvalidateRect(h,NULL,FALSE); } return 0;
@@ -2187,13 +2196,6 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         case IDM_FILE_SAVELOG: save_scrollback(); return 0;
         case IDM_FILE_PREFS:   do_preferences();  return 0;
         case IDM_FILE_EXIT:    DestroyWindow(h);  return 0;
-        case IDM_FILE_NEWTAB: {
-          const ShellPreset* dflt = g_config.shells.empty() ? nullptr : &g_config.shells[0];
-          for (const auto& sp : g_config.shells)
-            if (sp.name == g_config.default_shell) { dflt = &sp; break; }
-          if (dflt) new_session(*dflt);
-          return 0;
-        }
         case IDM_TAB_CLOSE:
           if (g_ctx_tab_idx >= 0) close_session(g_ctx_tab_idx, false);
           g_ctx_tab_idx = -1;
