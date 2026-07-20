@@ -1,4 +1,10 @@
 *.obj
 *.res
+*.pdb
+*.ilk
+*.exp
+*.idb
+*.tlog
+.vs/
 miniterm_debug.txt
 miniterm.json
